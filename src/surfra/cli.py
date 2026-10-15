@@ -44,7 +44,8 @@ def main(argv: list[str] | None = None) -> None:
     register = runner_sub.add_parser("register", help="Guess this machine's hardware and open a page to name it.")
     register.add_argument("--name", default="", help="Name the machine here instead of in the dashboard, such as desk-4090.")
     runner_sub.add_parser("start", help="Heartbeat and run one app at a time.")
-    runner_sub.add_parser("stop", help="Stop the runner and its app, and mark this machine offline.")
+    runner_stop = runner_sub.add_parser("stop", help="Stop the runner and its app, and mark this machine offline.")
+    runner_stop.add_argument("--force", action="store_true", help="Stop even if a job is running here. The job ends as stopped.")
     service = runner_sub.add_parser("service", help="Keep the runner running in the background with systemd (Linux).")
     service.add_argument("action", choices=("install", "remove"))
     runner_sub.add_parser("whoami", help="Print the runner id, owner, and whether it is busy.")
@@ -55,10 +56,18 @@ def main(argv: list[str] | None = None) -> None:
         help="cpu installs Surfra's local runner dependencies for CPU support. gpu installs them for GPU support.",
     )
 
+    from surfra.jobcli import build as build_jobs
+
+    build_jobs(sub)
+
     args = parser.parse_args(argv)
     if args.command == "worker":
         worker_main()
         return
+    if args.command == "job" and args.job_command == "agent":
+        from surfra.jobcli import run as run_job
+
+        raise SystemExit(run_job(args))
     from surfra.update import notice
 
     message = notice()
@@ -68,6 +77,10 @@ def main(argv: list[str] | None = None) -> None:
         from surfra.host import login
 
         raise SystemExit(login())
+    if args.command == "job":
+        from surfra.jobcli import run as run_job
+
+        raise SystemExit(run_job(args))
     if args.command == "runner" and args.runner_command == "install":
         raise SystemExit(_install(args.kind))
     from surfra.host import register, service, start, stop, whoami
@@ -76,6 +89,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(register(args.name))
     if args.runner_command == "service":
         raise SystemExit(service(args.action))
+    if args.runner_command == "stop":
+        raise SystemExit(stop(args.force))
     commands = {"start": start, "stop": stop, "whoami": whoami}
     raise SystemExit(commands[args.runner_command]())
 

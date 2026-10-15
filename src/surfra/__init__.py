@@ -5,7 +5,7 @@ A worker process is separate from the control plane and only holds a replica tok
 """
 
 from surfra.app import App, Workflow
-from surfra.client import Call, SurfraClient, SurfraError
+from surfra.client import Call, Job, SurfraClient, SurfraError
 from surfra.credentials import Credentials
 from surfra.sdk import Request, batch_size, handler, progress, stage, warmup
 from surfra.types import Autoscale, ProviderRow, Runtime
@@ -15,6 +15,7 @@ __all__ = [
     "Autoscale",
     "Call",
     "Credentials",
+    "Job",
     "ProviderRow",
     "Request",
     "Runtime",

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any
+from collections import deque
+from datetime import datetime, timedelta
+from typing import Any, Iterable, Iterator
 from urllib.parse import quote
 
 import httpx
@@ -13,6 +15,17 @@ from surfra.credentials import as_registry
 from surfra.types import Autoscale, Runtime
 
 _DONE = {"succeeded", "failed"}
+JOB_DONE = {"succeeded", "failed", "stopped", "lost"}
+# Lines are stored a little after they are printed, so a follow rereads this far back.
+LATE_LINES_SECONDS = 30
+
+
+def _rewound(stamp: str, seconds: float) -> str:
+    try:
+        moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return stamp
+    return (moment - timedelta(seconds=seconds)).isoformat()
 
 
 class SurfraError(RuntimeError):
@@ -69,6 +82,71 @@ class Call:
         if len(stages) == 1:
             return stages[0].get("output")
         return {stage.get("name"): stage.get("output") for stage in stages}
+
+
+class Job:
+    """One job. `wait` blocks until it ends. `logs` reads its output, and follows it with follow=True."""
+
+    def __init__(self, client: SurfraClient, view: dict[str, Any]):
+        self.client = client
+        self.view = view
+        self.id = str(view["id"])
+
+    @property
+    def status(self) -> str:
+        return str(self.view.get("status"))
+
+    def get(self) -> dict[str, Any]:
+        self.view = _checked(self.client._http.get(f"{self.client.base_url}/v1/jobs/{self.id}"))
+        return self.view
+
+    def stop(self) -> dict[str, Any]:
+        self.view = _checked(self.client._http.post(f"{self.client.base_url}/v1/jobs/{self.id}/stop"))
+        return self.view
+
+    def wait(self, *, interval: float = 5.0, timeout: float | None = None) -> dict[str, Any]:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.get().get("status") not in JOB_DONE:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"job {self.id} is still {self.status}")
+            time.sleep(interval)
+        return self.view
+
+    def logs(self, *, follow: bool = False, after: str | None = None, interval: float = 2.0) -> Iterator[dict[str, Any]]:
+        """Lines oldest first, as {"t", "s", "m"}. "s" is out, err, or sys for Surfra's own lines."""
+
+        page = 1000
+        seen: dict[tuple[str, str, str], str] = {}
+        cursor = after
+        rewind = False
+        while True:
+            params: dict[str, Any] = {"limit": page, "order": "asc"}
+            if cursor:
+                params["after"] = _rewound(cursor, LATE_LINES_SECONDS) if rewind else cursor
+            lines = _checked(self.client._http.get(f"{self.client.base_url}/v1/jobs/{self.id}/logs", params=params)).get("lines") or []
+            fresh = 0
+            for line in lines:
+                stamp = str(line.get("t") or "")
+                key = (stamp, str(line.get("s")), str(line.get("m")))
+                if key in seen:
+                    continue
+                seen[key] = stamp
+                fresh += 1
+                if stamp > (cursor or ""):
+                    cursor = stamp
+                yield line
+            if len(seen) > 20000 and cursor:
+                horizon = _rewound(cursor, LATE_LINES_SECONDS)
+                seen = {key: stamp for key, stamp in seen.items() if stamp >= horizon}
+            if len(lines) >= page and (fresh or rewind):
+                rewind = False
+                continue
+            if not follow:
+                return
+            rewind = True
+            if self.get().get("status") in JOB_DONE:
+                follow = False
+            time.sleep(interval)
 
 
 class SurfraClient:
@@ -166,3 +244,91 @@ class SurfraClient:
         """Enqueue, poll, and return the output."""
 
         return self.enqueue(app, payload).result(timeout=timeout)
+
+    def map(self, app: str, items: Iterable[dict[str, Any]], *, concurrency: int = 8, timeout: float | None = None) -> Iterator[Any]:
+        """Call an app once per item and yield outputs in order. At most `concurrency` calls wait at a time."""
+
+        source = iter(items)
+        waiting: deque[Call] = deque()
+
+        def fill() -> None:
+            while len(waiting) < max(1, concurrency):
+                try:
+                    item = next(source)
+                except StopIteration:
+                    return
+                waiting.append(self.enqueue(app, item))
+
+        fill()
+        while waiting:
+            call = waiting.popleft()
+            fill()
+            yield call.result(timeout=timeout)
+
+    def submit_job(
+        self,
+        entrypoint: str | None = None,
+        *,
+        args: list[str] | None = None,
+        image: str | None = None,
+        spec: str | None = None,
+        providers: list[dict[str, Any]] | None = None,
+        env: dict[str, str] | None = None,
+        secret: str | None = None,
+        docker_secret: str | None = None,
+        deadline_sec: int | None = None,
+        liveness_sec: int | None = None,
+        grace_sec: int | None = None,
+        call_apps: list[str] | None = None,
+        deny_apps: list[str] | None = None,
+        name: str | None = None,
+        submission_id: str | None = None,
+    ) -> Job:
+        """Run a command once on one machine. With spec, the saved job spec fills in what is left out.
+
+        entrypoint is a shell command, such as "bash train.sh". args are appended, quoted.
+        providers are machine rows in order, such as [{"provider": "runner", "runner": "desk-4090"}].
+        env is set in the container. Names starting with SURFRA_ are reserved.
+        call_apps lists the apps the job may call with the SURFRA_API_KEY Surfra gives it. ["*"] allows all.
+        submission_id makes the call safe to retry: the same id returns the same job.
+        """
+
+        body: dict[str, Any] = {
+            key: value
+            for key, value in {
+                "entrypoint": entrypoint,
+                "args": args,
+                "image": image,
+                "spec": spec,
+                "providers": providers,
+                "env": env,
+                "secret": secret,
+                "docker_secret": docker_secret,
+                "deadline_sec": deadline_sec,
+                "liveness_sec": liveness_sec,
+                "grace_sec": grace_sec,
+                "call_apps": call_apps,
+                "deny_apps": deny_apps,
+                "name": name,
+                "submission_id": submission_id,
+            }.items()
+            if value is not None
+        }
+        return Job(self, _checked(self._http.post(f"{self.base_url}/v1/jobs", json=body)))
+
+    def job(self, job_id: str) -> Job:
+        return Job(self, _checked(self._http.get(f"{self.base_url}/v1/jobs/{job_id}")))
+
+    def jobs(self, *, limit: int = 50, status: str = "") -> list[dict[str, Any]]:
+        return _checked(self._http.get(f"{self.base_url}/v1/jobs", params={"limit": limit, "status": status}))["jobs"]
+
+    def save_job_spec(self, name: str, **fields: Any) -> dict[str, Any]:
+        """Save a named job spec: image, entrypoint, args, providers, env, secret, deadline_sec, call_apps, and so on."""
+
+        return _checked(self._http.put(f"{self.base_url}/v1/job-specs/{quote(name, safe='')}", json=fields))
+
+    def job_specs(self) -> list[dict[str, Any]]:
+        return _checked(self._http.get(f"{self.base_url}/v1/job-specs"))["specs"]
+
+    def delete_job_spec(self, name: str) -> dict[str, Any]:
+        return _checked(self._http.delete(f"{self.base_url}/v1/job-specs/{quote(name, safe='')}"))

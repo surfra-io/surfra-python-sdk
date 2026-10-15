@@ -81,8 +81,10 @@ class LogShipper:
         self.every = every
         self.jitter = jitter
         self.lock = threading.Lock()
+        self.sending = threading.Lock()
         self.kick = threading.Event()
         self.dropped = 0
+        self.lost = 0
         self.dir.mkdir(parents=True, exist_ok=True)
         self.cap = max(MIN_DISK, int(shutil.disk_usage(self.dir).total * DISK_SHARE))
         self.pending = self.dir / "pending.ndjson"
@@ -100,11 +102,19 @@ class LogShipper:
             record["r"] = request
         line = (json.dumps(record, separators=(",", ":")) + "\n").encode()
         with self.lock:
-            self.file.write(line)
-            self.file.flush()
+            # A full disk drops the line. The pump must keep draining, or the app blocks on print.
+            try:
+                self.file.write(line)
+                self.file.flush()
+            except OSError:
+                self.lost += 1
+                return
             self.size += len(line)
             if self.size >= BATCH_BYTES:
-                self._rotate()
+                try:
+                    self._rotate()
+                except OSError:
+                    pass
                 self.kick.set()
 
     def note(self, message: str) -> None:
@@ -135,25 +145,36 @@ class LogShipper:
 
     def flush(self, timeout: float = 60.0) -> None:
         with self.lock:
-            self._rotate()
+            try:
+                self._rotate()
+            except OSError:
+                pass
             dropped, self.dropped = self.dropped, 0
+            lost, self.lost = self.lost, 0
         if dropped:
             self.note(f"dropped {dropped} log batches because Surfra was unreachable and the buffer was full")
-        for path in self._batches():
-            raw = path.read_bytes()
-            if raw.strip():
+        if lost:
+            self.note(f"dropped {lost} log lines because the disk was full")
+        # One sender at a time, or two flushes upload the same batch twice.
+        with self.sending:
+            for path in self._batches():
                 try:
-                    response = httpx.post(
-                        f"{self.master}/v1/workers/logs",
-                        content=gzip.compress(raw),
-                        headers={"Content-Type": "application/x-ndjson", "Content-Encoding": "gzip", "X-Surfra-Replica-Token": self.token},
-                        timeout=timeout,
-                    )
-                except httpx.HTTPError:
-                    return
-                if response.status_code >= 500 or response.status_code == 429:
-                    return
-            path.unlink(missing_ok=True)
+                    raw = path.read_bytes()
+                except FileNotFoundError:
+                    continue
+                if raw.strip():
+                    try:
+                        response = httpx.post(
+                            f"{self.master}/v1/workers/logs",
+                            content=gzip.compress(raw),
+                            headers={"Content-Type": "application/x-ndjson", "Content-Encoding": "gzip", "X-Surfra-Replica-Token": self.token},
+                            timeout=timeout,
+                        )
+                    except httpx.HTTPError:
+                        return
+                    if response.status_code >= 500 or response.status_code == 429:
+                        return
+                path.unlink(missing_ok=True)
 
     def run(self) -> None:
         while True:

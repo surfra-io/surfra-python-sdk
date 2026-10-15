@@ -306,29 +306,74 @@ def _pick_up_update(told: str) -> str:
 
 def _run_assignment(http: httpx.Client, master: str, saved: dict, assignment: dict) -> None:
     stop = threading.Event()
+    name = f"surfra-{assignment['replica_id']}"
+    job = assignment.get("job_id")
 
     def beat() -> None:
         while not stop.wait(20):
             try:
-                http.post(f"{master}/v1/runners/heartbeat")
-            except httpx.HTTPError:
+                response = http.post(f"{master}/v1/runners/heartbeat")
+                current = response.json().get("assignment") if response.is_success else None
+            except (httpx.HTTPError, ValueError):
                 continue
+            if response.is_success and (current or {}).get("replica_id") != assignment.get("replica_id"):
+                print("Surfra withdrew this assignment. Stopping its container.", flush=True)
+                subprocess.run(["docker", "stop", "-t", str(_stop_seconds(assignment)), name], capture_output=True, check=False)
+                return
 
     thread = threading.Thread(target=beat, daemon=True)
     thread.start()
     try:
         _docker(saved, assignment)
-    finally:
+    except SystemExit:
         stop.set()
-        for _attempt in range(30):
-            try:
-                http.post(f"{master}/v1/runners/release", json={"replica_id": assignment.get("replica_id")})
-                break
-            except httpx.HTTPError:
-                time.sleep(10)
+        if job and _container_running(name):
+            print(f"runner stopping. Job {job} keeps running in {name}, and the runner picks it up again when it starts.", flush=True)
+            raise
+        _release(http, master, assignment)
+        raise
+    except BaseException:
+        stop.set()
+        _release(http, master, assignment)
+        raise
+    stop.set()
+    _release(http, master, assignment)
+
+
+def _release(http: httpx.Client, master: str, assignment: dict) -> None:
+    for _attempt in range(30):
+        try:
+            http.post(f"{master}/v1/runners/release", json={"replica_id": assignment.get("replica_id")})
+            return
+        except httpx.HTTPError:
+            time.sleep(10)
+
+
+def _stop_seconds(assignment: dict) -> int:
+    return int(assignment.get("grace") or 0) + 10 if assignment.get("job_id") else 10
+
+
+def _container_running(name: str) -> bool:
+    found = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", name], capture_output=True, text=True, check=False)
+    return found.returncode == 0 and found.stdout.strip() == "true"
+
+
+def _pull(image: str) -> None:
+    if subprocess.run(["docker", "pull", image], check=False).returncode == 0:
+        return
+    if subprocess.run(["docker", "image", "inspect", image], capture_output=True, check=False).returncode == 0:
+        print(f"could not pull {image}. Using the copy already on this machine.", flush=True)
+        return
+    raise RuntimeError(f"could not pull {image}, and this machine has no copy of it")
 
 
 def _docker(saved: dict, assignment: dict) -> None:
+    name = f"surfra-{assignment['replica_id']}"
+    job = assignment.get("job_id")
+    if job and _container_running(name):
+        print(f"picking up job {job}, which is still running in {name}", flush=True)
+        subprocess.run(["docker", "wait", name], capture_output=True, check=False)
+        return
     password = ""
     if assignment.get("docker_password_box"):
         password = open_box(saved["private_key"], assignment["docker_password_box"])
@@ -339,16 +384,25 @@ def _docker(saved: dict, assignment: dict) -> None:
             login.append(server)
         subprocess.run(login, input=password, text=True, check=True)
     image = assignment["image"]
-    subprocess.run(["docker", "pull", image], check=True)
-    name = f"surfra-{assignment['replica_id']}"
+    _pull(image)
     subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
-    command = ["docker", "run", "--rm", "--init", "--name", name]
+    # A job runs detached, so restarting or updating the runner never stops it.
+    command = ["docker", "run", "-d" if job else "--rm", "--init", "--name", name]
+    if job:
+        command.extend(["--rm", "--label", f"surfra.job={job}", "--stop-timeout", str(_stop_seconds(assignment))])
     if assignment.get("gpus"):
         command.extend(["--gpus", "all"])
+    if os.environ.get("SURFRA_DOCKER_NETWORK"):
+        command.extend(["--network", os.environ["SURFRA_DOCKER_NETWORK"]])
     for key, value in (assignment.get("env") or {}).items():
         command.extend(["-e", f"{key}={value}"])
     command.append(image)
-    command.extend(["surfra", "worker"])
+    command.extend(assignment.get("command") or ["surfra", "worker"])
+    if job:
+        print(f"running job {job} from {image}", flush=True)
+        subprocess.run(command, stdout=subprocess.DEVNULL, check=True)
+        subprocess.run(["docker", "wait", name], capture_output=True, check=False)
+        return
     print(f"running {assignment.get('app_name')} from {image}")
     try:
         subprocess.run(command, check=False)
@@ -366,13 +420,28 @@ def _service_active() -> bool:
     return subprocess.run(["systemctl", "--user", "is-active", "--quiet", "surfra-runner"], check=False).returncode == 0
 
 
-def stop() -> int:
+def _running_jobs() -> list[str]:
+    if not shutil.which("docker"):
+        return []
+    found = subprocess.run(
+        ["docker", "ps", "--filter", "label=surfra.job", "--format", '{{.Label "surfra.job"}}'],
+        capture_output=True, text=True, check=False,
+    )
+    return [line for line in found.stdout.split() if line]
+
+
+def stop(force: bool = False) -> int:
     """Take this machine out of rotation: stop the runner and its app, and mark it offline."""
 
     saved = _read(RUNNER)
     token = saved.get("token")
     if not token:
         print("this machine is not registered. Run surfra runner register.", file=sys.stderr)
+        return 1
+    jobs = _running_jobs()
+    if jobs and not force:
+        print(f"job {', '.join(jobs)} is running on this machine. Stopping the runner would end it.", file=sys.stderr)
+        print("Stop the job with surfra job stop, or end it now with: surfra runner stop --force", file=sys.stderr)
         return 1
     master = (saved.get("master") or _master()).rstrip("/")
     told = _go_offline(master, token)
@@ -389,7 +458,13 @@ def stop() -> int:
         running = subprocess.run(["docker", "ps", "-q", "--filter", "name=surfra-rep_"], capture_output=True, text=True, check=False).stdout.split()
         if running:
             print(f"stopping {len(running)} app container{'s' if len(running) > 1 else ''}")
-            subprocess.run(["docker", "stop", *running], capture_output=True, check=False)
+            # Job containers carry their own --stop-timeout, so their grace period is kept.
+            jobs = set(subprocess.run(["docker", "ps", "-q", "--filter", "label=surfra.job"], capture_output=True, text=True, check=False).stdout.split())
+            apps = [item for item in running if item not in jobs]
+            if apps:
+                subprocess.run(["docker", "stop", "-t", "40", *apps], capture_output=True, check=False)
+            if jobs:
+                subprocess.run(["docker", "stop", *jobs], capture_output=True, check=False)
     # A heartbeat sent while the runner was shutting down can mark it online again.
     if not _go_offline(master, token) and not told:
         print(f"stopped here, but could not tell {master}. It shows offline within a minute.", file=sys.stderr)
