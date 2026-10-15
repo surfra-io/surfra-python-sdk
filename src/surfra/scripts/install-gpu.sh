@@ -9,6 +9,10 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
   echo "nvidia-smi is not on this machine. Install the NVIDIA driver, then run this script again." >&2
   exit 1
 fi
+if command -v nvidia-ctk >/dev/null 2>&1 && docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q nvidia; then
+  echo "Docker can already use the GPU. Run: surfra runner start"
+  exit 0
+fi
 if [ -r /etc/os-release ]; then
   # shellcheck disable=SC1091
   . /etc/os-release

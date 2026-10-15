@@ -69,14 +69,25 @@ def login() -> int:
     return 1
 
 
+def _ram_bytes() -> int:
+    if sys.platform == "win32":
+        import ctypes
+
+        class Status(ctypes.Structure):
+            _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong)] + [(f"pad{index}", ctypes.c_ulonglong) for index in range(5)]
+
+        status = Status()
+        status.length = ctypes.sizeof(Status)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+        return int(status.total)
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, ValueError, OSError):
+        return 0
+
+
 def probe() -> dict:
-    ram_gb = 1
-    meminfo = Path("/proc/meminfo")
-    if meminfo.is_file():
-        for line in meminfo.read_text().splitlines():
-            if line.startswith("MemTotal:"):
-                ram_gb = max(1, int(line.split()[1]) // 1024 // 1024)
-                break
+    ram_gb = max(1, round(_ram_bytes() / 2**30))
     gpu = ""
     count = 0
     if shutil.which("nvidia-smi"):
@@ -122,7 +133,24 @@ def _listen_for_callback():
     return server, finished
 
 
-def register() -> int:
+def _save_runner(viewed: dict, private_b64: str, master: str, hardware: dict) -> None:
+    _write(
+        RUNNER,
+        {
+            "id": viewed["runner_id"],
+            "token": viewed["token"],
+            "private_key": private_b64,
+            "master": master,
+            "gpu_count": hardware["gpu_count"],
+        },
+    )
+    print(f"runner {viewed['runner_id']}")
+    print("Start it with: surfra runner start")
+
+
+def register(name: str = "") -> int:
+    """Add this machine to the account. With a name it finishes here; without one a dashboard page confirms it."""
+
     master = _master()
     token = _session()
     hardware = probe()
@@ -135,8 +163,8 @@ def register() -> int:
         private.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
     ).decode()
     existing = _read(RUNNER)
-    server, finished = _listen_for_callback()
-    callback = f"http://127.0.0.1:{server.server_address[1]}/callback"
+    server, finished = (None, None) if name else _listen_for_callback()
+    callback = f"http://127.0.0.1:{server.server_address[1]}/callback" if server else ""
     try:
         with httpx.Client(timeout=30, headers={"Authorization": f"Bearer {token}"}) as http:
             started = http.post(
@@ -150,8 +178,17 @@ def register() -> int:
             )
             started.raise_for_status()
             body = started.json()
-            print("Adding this machine in the dashboard.")
-            print(f"Guessed {hardware['vcpu']} vCPU, {hardware['ram_gb']} GB RAM, {hardware['gpu'] or 'no GPU'}.")
+            print(f"Found {hardware['vcpu']} vCPU, {hardware['ram_gb']} GB RAM, {hardware['gpu'] or 'no GPU'}.")
+            if name:
+                confirmed = http.post(f"{master}/v1/runners", json={"pending_id": body["pending_id"], "name": name, **hardware})
+                if confirmed.status_code >= 400:
+                    print(f"registration failed: {confirmed.text[:300]}", file=sys.stderr)
+                    return 1
+                pending = http.get(f"{master}/v1/runners/pending/{body['pending_id']}")
+                pending.raise_for_status()
+                _save_runner(pending.json(), private_b64, master, hardware)
+                return 0
+            print("Name this machine in the dashboard:")
             print(body["url"])
             open_page(body["url"])
             deadline = time.time() + 600
@@ -161,21 +198,11 @@ def register() -> int:
                 pending.raise_for_status()
                 viewed = pending.json()
                 if viewed.get("token") and viewed.get("runner_id"):
-                    _write(
-                        RUNNER,
-                        {
-                            "id": viewed["runner_id"],
-                            "token": viewed["token"],
-                            "private_key": private_b64,
-                            "master": master,
-                            "gpu_count": hardware["gpu_count"],
-                        },
-                    )
-                    print(f"runner {viewed['runner_id']}")
-                    print("Start it with: surfra runner start")
+                    _save_runner(viewed, private_b64, master, hardware)
                     return 0
     finally:
-        server.shutdown()
+        if server:
+            server.shutdown()
     print("registration timed out", file=sys.stderr)
     return 1
 
@@ -206,11 +233,12 @@ def whoami() -> int:
 
 
 def _missing_runtime(gpu: bool) -> str | None:
-    script = _script("install-gpu.sh" if gpu else "install-cpu.sh")
+    command = f"surfra runner install {'gpu' if gpu else 'cpu'}"
     if shutil.which("docker") is None:
-        return f"Docker is not installed. Run:\n  bash {script}"
-    if gpu and not Path("/usr/bin/nvidia-container-runtime").exists() and shutil.which("nvidia-ctk") is None:
-        return f"This machine has a GPU, and Docker cannot see it yet. Run:\n  bash {script}"
+        return f"Docker is not installed. Run:\n  {command}"
+    # Docker Desktop on macOS and Windows brings its own GPU support, so only Linux needs the toolkit.
+    if gpu and sys.platform == "linux" and not Path("/usr/bin/nvidia-container-runtime").exists() and shutil.which("nvidia-ctk") is None:
+        return f"This machine has a GPU, and Docker cannot see it yet. Run:\n  {command}"
     return None
 
 
@@ -229,10 +257,18 @@ def start() -> int:
     print(f"runner {saved.get('id')} waiting for an app")
     with httpx.Client(timeout=30, headers=headers) as http:
         while True:
-            response = http.post(f"{master}/v1/runners/heartbeat")
+            try:
+                response = http.post(f"{master}/v1/runners/heartbeat")
+            except httpx.HTTPError as exc:
+                print(f"cannot reach {master}: {exc}. Retrying.", file=sys.stderr)
+                time.sleep(10)
+                continue
             if response.status_code == 401:
                 print("this runner was registered to another account. Run surfra runner register.", file=sys.stderr)
                 return 1
+            if response.status_code >= 500:
+                time.sleep(10)
+                continue
             response.raise_for_status()
             assignment = (response.json() or {}).get("assignment")
             if not assignment:
@@ -246,7 +282,10 @@ def _run_assignment(http: httpx.Client, master: str, saved: dict, assignment: di
 
     def beat() -> None:
         while not stop.wait(20):
-            http.post(f"{master}/v1/runners/heartbeat")
+            try:
+                http.post(f"{master}/v1/runners/heartbeat")
+            except httpx.HTTPError:
+                continue
 
     thread = threading.Thread(target=beat, daemon=True)
     thread.start()
@@ -254,7 +293,12 @@ def _run_assignment(http: httpx.Client, master: str, saved: dict, assignment: di
         _docker(saved, assignment)
     finally:
         stop.set()
-        http.post(f"{master}/v1/runners/release", json={"replica_id": assignment.get("replica_id")})
+        for _attempt in range(30):
+            try:
+                http.post(f"{master}/v1/runners/release", json={"replica_id": assignment.get("replica_id")})
+                break
+            except httpx.HTTPError:
+                time.sleep(10)
 
 
 def _docker(saved: dict, assignment: dict) -> None:
@@ -278,3 +322,40 @@ def _docker(saved: dict, assignment: dict) -> None:
     command.extend(["surfra", "worker"])
     print(f"running {assignment.get('app_name')} from {image}")
     subprocess.run(command, check=False)
+
+
+UNIT = Path.home() / ".config" / "systemd" / "user" / "surfra-runner.service"
+
+
+def service(action: str) -> int:
+    """Keep `surfra runner start` running with a systemd user service."""
+
+    if sys.platform != "linux" or shutil.which("systemctl") is None:
+        print("The runner service uses systemd. On this system, keep `surfra runner start` running in a terminal.", file=sys.stderr)
+        return 1
+    if action == "remove":
+        subprocess.run(["systemctl", "--user", "disable", "--now", "surfra-runner"], check=False)
+        UNIT.unlink(missing_ok=True)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        print("runner service removed")
+        return 0
+    if not _read(RUNNER).get("token"):
+        print("this machine is not registered. Run surfra runner register.", file=sys.stderr)
+        return 1
+    UNIT.parent.mkdir(parents=True, exist_ok=True)
+    UNIT.write_text(
+        "[Unit]\n"
+        "Description=Surfra runner\n"
+        "After=network-online.target\n\n"
+        "[Service]\n"
+        f"ExecStart={sys.executable} -m surfra runner start\n"
+        "Restart=always\n"
+        "RestartSec=10\n\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "--now", "surfra-runner"], check=True)
+    print("runner service started. Logs: journalctl --user -u surfra-runner -f")
+    print(f"It stops when you log out unless lingering is on: sudo loginctl enable-linger {os.environ.get('USER') or '$USER'}")
+    return 0
