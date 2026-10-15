@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -21,6 +22,7 @@ from surfra.cli import open_page
 HOME = Path.home() / ".surfra"
 CONFIG = HOME / "config.json"
 RUNNER = HOME / "runner.json"
+PID = HOME / "runner.pid"
 
 
 def _master() -> str:
@@ -254,6 +256,7 @@ def start() -> int:
         return 1
     master = (saved.get("master") or _master()).rstrip("/")
     headers = {"Authorization": f"Bearer {token}"}
+    PID.write_text(str(os.getpid()))
     print(f"runner {saved.get('id')} waiting for an app")
     with httpx.Client(timeout=30, headers=headers) as http:
         while True:
@@ -322,6 +325,45 @@ def _docker(saved: dict, assignment: dict) -> None:
     command.extend(["surfra", "worker"])
     print(f"running {assignment.get('app_name')} from {image}")
     subprocess.run(command, check=False)
+
+
+def _service_active() -> bool:
+    if sys.platform != "linux" or shutil.which("systemctl") is None:
+        return False
+    return subprocess.run(["systemctl", "--user", "is-active", "--quiet", "surfra-runner"], check=False).returncode == 0
+
+
+def stop() -> int:
+    """Take this machine out of rotation: stop the runner and its app, and mark it offline."""
+
+    saved = _read(RUNNER)
+    token = saved.get("token")
+    if not token:
+        print("this machine is not registered. Run surfra runner register.", file=sys.stderr)
+        return 1
+    service_on = _service_active()
+    if service_on:
+        subprocess.run(["systemctl", "--user", "stop", "surfra-runner"], check=False)
+    elif PID.exists():
+        try:
+            os.kill(int(PID.read_text().strip()), signal.SIGTERM)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+    PID.unlink(missing_ok=True)
+    if shutil.which("docker"):
+        running = subprocess.run(["docker", "ps", "-q", "--filter", "name=surfra-rep_"], capture_output=True, text=True, check=False).stdout.split()
+        if running:
+            print(f"stopping {len(running)} app container{'s' if len(running) > 1 else ''}")
+            subprocess.run(["docker", "stop", *running], capture_output=True, check=False)
+    master = (saved.get("master") or _master()).rstrip("/")
+    try:
+        response = httpx.post(f"{master}/v1/runners/offline", headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        print(f"stopped here, but could not tell {master} ({exc}). It shows offline within a minute.", file=sys.stderr)
+    print("runner stopped. It takes no work until you start it again:")
+    print("  systemctl --user start surfra-runner" if service_on or UNIT.exists() else "  surfra runner start")
+    return 0
 
 
 UNIT = Path.home() / ".config" / "systemd" / "user" / "surfra-runner.service"

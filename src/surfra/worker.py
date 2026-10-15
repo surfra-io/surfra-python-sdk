@@ -33,11 +33,18 @@ class WorkerClient:
         self.waiting = False
         self._http = httpx.Client(timeout=60)
 
-    def register(self, concurrent_workers: int = 1) -> str:
-        response = self._http.post(
-            f"{self.master}/v1/workers/register",
-            json={"replica_token": self.replica_token, "concurrent_workers": concurrent_workers},
-        )
+    def register(self, concurrent_workers: int = 1, *, wait: float = 15.0) -> str:
+        # The control plane can start a worker before the replica row commits as ready.
+        deadline = time.monotonic() + wait
+        while True:
+            response = self._http.post(
+                f"{self.master}/v1/workers/register",
+                json={"replica_token": self.replica_token, "concurrent_workers": concurrent_workers},
+            )
+            unknown = response.status_code == 401 and "unknown replica token" in response.text
+            if not unknown or time.monotonic() >= deadline:
+                break
+            time.sleep(0.5)
         response.raise_for_status()
         self.worker_id = response.json()["worker_id"]
         return self.worker_id
@@ -197,8 +204,10 @@ def _child_entry(app_path: str, jobs: Any, results: Any, mode: str) -> None:
 
 
 def _serve_in_process(master: str, replica_token: str, app_path: str, *, once: bool, interval: float) -> None:
+    began = time.monotonic()
     load_app(app_path)
     run_warmup()
+    logship.note(f"{app_path} loaded and warmed up in {time.monotonic() - began:.1f}s")
     spec = registered_handler_spec() or {}
     copies = max(1, int(spec.get("concurrent_workers") or 1))
     clients = [WorkerClient(master, replica_token) for _ in range(copies)]
@@ -229,11 +238,13 @@ def _serve_supervised(master: str, replica_token: str, app_path: str, *, once: b
     ctx = multiprocessing.get_context("spawn")
     results = ctx.Queue()
     first_jobs = ctx.Queue()
+    began = time.monotonic()
     process = _spawn_child(ctx, app_path, first_jobs, results, mode, replica_token)
     ready = results.get()
     if ready.get("kind") != "ready":
         process.terminate()
         raise RuntimeError("worker child did not start")
+    logship.note(f"{app_path} loaded and warmed up in {time.monotonic() - began:.1f}s")
     adopt_handler_spec(ready["spec"])
     spec = registered_handler_spec() or {}
     copies = max(1, int(spec.get("concurrent_workers") or 1))
@@ -387,6 +398,7 @@ def baked_runtime() -> tuple[str, str, str]:
 def main() -> None:
     master, token, app_path = baked_runtime()
     logship.start(master, token)
+    logship.note(f"worker starting, loading {app_path}")
     once = os.environ.get("SURFRA_ONCE", "").strip().lower() in {"1", "true", "yes"}
     serve(master, token, app_path, once=once)
 

@@ -44,6 +44,7 @@ def main(argv: list[str] | None = None) -> None:
     register = runner_sub.add_parser("register", help="Guess this machine's hardware and open a page to name it.")
     register.add_argument("--name", default="", help="Name the machine here instead of in the dashboard, such as desk-4090.")
     runner_sub.add_parser("start", help="Heartbeat and run one app at a time.")
+    runner_sub.add_parser("stop", help="Stop the runner and its app, and mark this machine offline.")
     service = runner_sub.add_parser("service", help="Keep the runner running in the background with systemd (Linux).")
     service.add_argument("action", choices=("install", "remove"))
     runner_sub.add_parser("whoami", help="Print the runner id, owner, and whether it is busy.")
@@ -64,13 +65,13 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(login())
     if args.command == "runner" and args.runner_command == "install":
         raise SystemExit(_install(args.kind))
-    from surfra.host import register, service, start, whoami
+    from surfra.host import register, service, start, stop, whoami
 
     if args.runner_command == "register":
         raise SystemExit(register(args.name))
     if args.runner_command == "service":
         raise SystemExit(service(args.action))
-    commands = {"start": start, "whoami": whoami}
+    commands = {"start": start, "stop": stop, "whoami": whoami}
     raise SystemExit(commands[args.runner_command]())
 
 

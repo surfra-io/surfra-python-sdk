@@ -32,6 +32,14 @@ DISK_SHARE = 0.05
 
 _running: dict[str, int] = {}
 _running_lock = threading.Lock()
+_shipper: "LogShipper | None" = None
+
+
+def note(message: str) -> None:
+    """A Surfra line in the app's logs, apart from what the app prints."""
+
+    if _shipper is not None:
+        _shipper.note(message)
 
 
 @contextmanager
@@ -203,4 +211,6 @@ def start(master: str, token: str) -> LogShipper | None:
         return None
     threading.Thread(target=shipper.run, name="surfra-logs", daemon=True).start()
     atexit.register(lambda: shipper.flush(timeout=10))
+    global _shipper
+    _shipper = shipper
     return shipper
