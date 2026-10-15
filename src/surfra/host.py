@@ -257,6 +257,7 @@ def start() -> int:
     master = (saved.get("master") or _master()).rstrip("/")
     headers = {"Authorization": f"Bearer {token}"}
     PID.write_text(str(os.getpid()))
+    signal.signal(signal.SIGTERM, _exit_on_term)
     print(f"runner {saved.get('id')} waiting for an app")
     with httpx.Client(timeout=30, headers=headers) as http:
         while True:
@@ -316,7 +317,9 @@ def _docker(saved: dict, assignment: dict) -> None:
         subprocess.run(login, input=password, text=True, check=True)
     image = assignment["image"]
     subprocess.run(["docker", "pull", image], check=True)
-    command = ["docker", "run", "--rm", "--name", f"surfra-{assignment['replica_id']}"]
+    name = f"surfra-{assignment['replica_id']}"
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
+    command = ["docker", "run", "--rm", "--init", "--name", name]
     if assignment.get("gpus"):
         command.extend(["--gpus", "all"])
     for key, value in (assignment.get("env") or {}).items():
@@ -324,7 +327,14 @@ def _docker(saved: dict, assignment: dict) -> None:
     command.append(image)
     command.extend(["surfra", "worker"])
     print(f"running {assignment.get('app_name')} from {image}")
-    subprocess.run(command, check=False)
+    try:
+        subprocess.run(command, check=False)
+    finally:
+        subprocess.run(["docker", "stop", "-t", "10", name], capture_output=True, check=False)
+
+
+def _exit_on_term(_signum: int, _frame: object) -> None:
+    raise SystemExit(0)
 
 
 def _service_active() -> bool:
