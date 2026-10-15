@@ -1,0 +1,32 @@
+[project]
+name = "surfra"
+version = "0.1.0"
+description = "Surfra Python SDK. Users own the model. The worker runs it."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = ["cryptography", "httpx"]
+
+[project.urls]
+Homepage = "https://surfra.io"
+Documentation = "https://docs.surfra.io"
+Source = "https://github.com/surfra-io/surfra-python-sdk"
+
+[project.scripts]
+surfra = "surfra.cli:main"
+surfra-worker = "surfra.worker:main"
+
+[tool.setuptools.package-data]
+surfra = ["scripts/*.sh"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
