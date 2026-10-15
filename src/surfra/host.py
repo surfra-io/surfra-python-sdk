@@ -16,6 +16,7 @@ import httpx
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
+from surfra import update
 from surfra.box import open_box
 from surfra.cli import open_page
 
@@ -259,8 +260,13 @@ def start() -> int:
     PID.write_text(str(os.getpid()))
     signal.signal(signal.SIGTERM, _exit_on_term)
     print(f"runner {saved.get('id')} waiting for an app")
+    checked = 0.0
+    told = ""
     with httpx.Client(timeout=30, headers=headers) as http:
         while True:
+            if time.monotonic() - checked > 60:
+                checked = time.monotonic()
+                told = _pick_up_update(told)
             try:
                 response = http.post(f"{master}/v1/runners/heartbeat")
             except httpx.HTTPError as exc:
@@ -279,6 +285,23 @@ def start() -> int:
                 time.sleep(5)
                 continue
             _run_assignment(http, master, saved, assignment)
+
+
+def _pick_up_update(told: str) -> str:
+    """Between apps, switch to a newer install on disk. Never while an app is running."""
+
+    on_disk = update.installed()
+    if update.newer(on_disk, update.RUNNING):
+        print(f"surfra {on_disk} is installed. Restarting the runner on it.", flush=True)
+        try:
+            os.execv(sys.executable, [sys.executable, "-m", "surfra", "runner", "start"])
+        except OSError as exc:
+            print(f"could not restart on surfra {on_disk} yet ({exc}). Trying again in a minute.", flush=True)
+    message = update.notice()
+    if message and message != told:
+        print(message, flush=True)
+        print("The runner switches to the new version on its own once it is idle.", flush=True)
+    return message or told
 
 
 def _run_assignment(http: httpx.Client, master: str, saved: dict, assignment: dict) -> None:

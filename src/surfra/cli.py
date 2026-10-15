@@ -59,6 +59,11 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "worker":
         worker_main()
         return
+    from surfra.update import notice
+
+    message = notice()
+    if message:
+        print(message + "\n", file=sys.stderr)
     if args.command == "login":
         from surfra.host import login
 

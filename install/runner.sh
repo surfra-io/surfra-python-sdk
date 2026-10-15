@@ -44,8 +44,12 @@ for candidate in python3.13 python3.12 python3.11 python3; do
 done
 
 mkdir -p "$home" "$bindir"
-rm -rf "$home/venv"
-if [ -n "$python" ] && "$python" -m venv "$home/venv" >/dev/null 2>&1; then
+if [ -x "$home/venv/bin/python" ] && "$home/venv/bin/python" -m pip --version >/dev/null 2>&1; then
+  # Upgrade in place so a running runner keeps working until it restarts itself between apps.
+  "$home/venv/bin/python" -m pip install --quiet --upgrade "$package"
+elif [ -x "$home/venv/bin/python" ] && [ -x "$home/bin/uv" ]; then
+  "$home/bin/uv" pip install --quiet --python "$home/venv/bin/python" "$package"
+elif rm -rf "$home/venv" && [ -n "$python" ] && "$python" -m venv "$home/venv" >/dev/null 2>&1; then
   "$home/venv/bin/python" -m pip install --quiet --upgrade pip
   "$home/venv/bin/python" -m pip install --quiet --upgrade "$package"
 else
@@ -58,6 +62,9 @@ else
 fi
 ln -sf "$home/venv/bin/surfra" "$bindir/surfra"
 echo "surfra $("$home/venv/bin/python" -c 'from importlib.metadata import version; print(version("surfra"))') installed to $bindir/surfra"
+if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet surfra-runner 2>/dev/null; then
+  echo "The runner service switches to this version on its own the next time it is idle."
+fi
 
 case ":$PATH:" in
   *":$bindir:"*) ;;

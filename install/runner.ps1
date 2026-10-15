@@ -29,9 +29,24 @@ function Find-Python {
 }
 
 New-Item -ItemType Directory -Force -Path $surfraHome | Out-Null
-if (Test-Path $venv) { Remove-Item -Recurse -Force $venv }
-$python = Find-Python
-if ($python) {
+$venvPython = Join-Path $scripts "python.exe"
+$uvExe = Join-Path (Join-Path $surfraHome "bin") "uv.exe"
+$upgraded = $false
+if (Test-Path $venvPython) {
+    # Upgrade in place: a running surfra.exe locks the venv, so it cannot be deleted.
+    & $venvPython -m pip --version 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        & $venvPython -m pip install --quiet --upgrade $package
+        $upgraded = $true
+    } elseif (Test-Path $uvExe) {
+        & $uvExe pip install --quiet --python $venvPython $package
+        $upgraded = $true
+    }
+}
+if (-not $upgraded -and (Test-Path $venv)) { Remove-Item -Recurse -Force $venv }
+$python = if ($upgraded) { $null } else { Find-Python }
+if ($upgraded) {
+} elseif ($python) {
     $exe = $python[0]
     $rest = @($python | Select-Object -Skip 1)
     & $exe @rest -m venv $venv
