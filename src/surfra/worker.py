@@ -31,6 +31,7 @@ class WorkerClient:
         self.replica_token = replica_token
         self.worker_id: str | None = None
         self.waiting = False
+        self.backoff = 1.0
         self._http = httpx.Client(timeout=60)
 
     def register(self, concurrent_workers: int = 1, *, wait: float = 15.0) -> str:
@@ -48,6 +49,31 @@ class WorkerClient:
         response.raise_for_status()
         self.worker_id = response.json()["worker_id"]
         return self.worker_id
+
+    def guard(self, step: Any, copies: int) -> bool:
+        """Run one step. Control plane hiccups wait and retry instead of ending the worker."""
+
+        try:
+            ran = step()
+            self.backoff = 1.0
+            return ran
+        except httpx.HTTPStatusError as exc:
+            status, text = exc.response.status_code, exc.response.text
+            if status == 401 and "unknown replica token" in text:
+                _wait_for_shutdown()
+            if status == 401 and "worker is not registered" in text:
+                # Surfra requeued what this worker held. Register again and keep going.
+                self.register(copies)
+                return False
+            if status < 500 and status != 429:
+                raise
+            reason = f"{status} {exc.response.reason_phrase}"
+        except httpx.TransportError as exc:
+            reason = type(exc).__name__
+        logship.note(f"control plane unavailable ({reason}), retrying in {self.backoff:.0f}s")
+        time.sleep(self.backoff)
+        self.backoff = min(self.backoff * 2, 30.0)
+        return False
 
     def next_stages(self, limit: int) -> list[dict[str, Any]]:
         response = self._http.post(
@@ -214,7 +240,7 @@ def _serve_in_process(master: str, replica_token: str, app_path: str, *, once: b
     for client in clients:
         client.register(copies)
     threads = [
-        threading.Thread(target=_loop, args=(client,), kwargs={"once": once, "interval": interval}, daemon=True)
+        threading.Thread(target=_loop, args=(client,), kwargs={"once": once, "interval": interval, "copies": copies}, daemon=True)
         for client in clients
     ]
     for thread in threads:
@@ -290,7 +316,7 @@ def _serve_supervised(master: str, replica_token: str, app_path: str, *, once: b
 
     def loop(client: WorkerClient, jobs: Any) -> None:
         while True:
-            ran = _step_remote(client, jobs, pending, answers, lock)
+            ran = client.guard(lambda: _step_remote(client, jobs, pending, answers, lock), copies)
             if once and ran:
                 return
             if not ran:
@@ -372,9 +398,17 @@ def serve(master: str, replica_token: str, app_path: str, *, once: bool = False,
         _serve_in_process(master, replica_token, app_path, once=once, interval=interval)
 
 
-def _loop(client: WorkerClient, *, once: bool, interval: float) -> None:
+def _wait_for_shutdown() -> None:
+    """Surfra stopped this replica. Exiting would make a cloud restart policy start it again."""
+
+    logship.note("Surfra stopped this replica. Waiting for the container to be shut down.")
     while True:
-        ran = client.step()
+        time.sleep(3600)
+
+
+def _loop(client: WorkerClient, *, once: bool, interval: float, copies: int = 1) -> None:
+    while True:
+        ran = client.guard(client.step, copies)
         if once and ran:
             return
         if not ran:
