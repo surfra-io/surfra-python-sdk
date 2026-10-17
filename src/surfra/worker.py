@@ -23,6 +23,8 @@ from surfra.runner import load_app, run_handler_batch, run_warmup
 from surfra.sdk import adopt_handler_spec, bind_progress_hook, registered_handler_spec, take_batch, unbind_progress_hook
 
 _BAKED = ("SURFRA_MASTER", "SURFRA_REPLICA_TOKEN", "SURFRA_ENTRYPOINT")
+# An idle poll waits on Surfra this long for work, so a worker does not ask every few seconds.
+POLL_WAIT = 20.0
 
 
 class WorkerClient:
@@ -32,7 +34,23 @@ class WorkerClient:
         self.worker_id: str | None = None
         self.waiting = False
         self.backoff = 1.0
+        self._pause: float | None = None
         self._http = httpx.Client(timeout=60)
+
+    def pause(self, interval: float) -> float:
+        """Seconds to sleep after a step that ran nothing."""
+
+        pause, self._pause = self._pause, None
+        return interval if pause is None else pause
+
+    def note_empty(self, started: float) -> None:
+        # Surfra already held the poll open. An older control plane answers at once, so keep the interval then.
+        self._pause = 0.0 if time.monotonic() - started >= 1.0 else None
+
+    def note_filling(self, oldest_age_ms: int, wait_ms: int) -> None:
+        """A batch is filling. Look again when the oldest call has waited long enough, at most 4 times a second."""
+
+        self._pause = min(0.25, max(0.05, (wait_ms - oldest_age_ms) / 1000)) if oldest_age_ms < wait_ms else 0.25
 
     def register(self, concurrent_workers: int = 1, *, wait: float = 15.0) -> str:
         # The control plane can start a worker before the replica row commits as ready.
@@ -75,10 +93,10 @@ class WorkerClient:
         self.backoff = min(self.backoff * 2, 30.0)
         return False
 
-    def next_stages(self, limit: int) -> list[dict[str, Any]]:
+    def next_stages(self, limit: int, *, wait: float = 0.0) -> list[dict[str, Any]]:
         response = self._http.post(
             f"{self.master}/v1/workers/next",
-            json={"replica_token": self.replica_token, "worker_id": self.worker_id, "limit": limit},
+            json={"replica_token": self.replica_token, "worker_id": self.worker_id, "limit": limit, "wait": wait},
         )
         response.raise_for_status()
         body = response.json()
@@ -126,9 +144,11 @@ class WorkerClient:
 
         spec = registered_handler_spec() or {}
         batch_max = int(spec.get("batch_max") or 1)
-        stages = self.next_stages(batch_max)
+        started = time.monotonic()
+        stages = self.next_stages(batch_max, wait=POLL_WAIT)
         if not stages:
             self.waiting = False
+            self.note_empty(started)
             return False
         if batch_max > 1:
             age = _oldest_age_ms(stages)
@@ -141,6 +161,7 @@ class WorkerClient:
             )
             if count == 0:
                 self.waiting = True
+                self.note_filling(age, int(spec.get("wait_ms") or 0))
                 return False
             stages = stages[:count]
         self.waiting = False
@@ -320,7 +341,7 @@ def _serve_supervised(master: str, replica_token: str, app_path: str, *, once: b
             if once and ran:
                 return
             if not ran:
-                time.sleep(0.05 if client.waiting else interval)
+                time.sleep(client.pause(interval))
 
     threads = [
         threading.Thread(target=loop, args=(client, queues[index % len(queues)]), daemon=True)
@@ -345,20 +366,24 @@ def _step_remote(
 ) -> bool:
     spec = registered_handler_spec() or {}
     batch_max = int(spec.get("batch_max") or 1)
-    stages = client.next_stages(batch_max)
+    started = time.monotonic()
+    stages = client.next_stages(batch_max, wait=POLL_WAIT)
     if not stages:
         client.waiting = False
+        client.note_empty(started)
         return False
     if batch_max > 1:
+        age = _oldest_age_ms(stages)
         count = take_batch(
             len(stages),
             batch_min=int(spec.get("batch_min") or 1),
             batch_max=batch_max,
             wait_ms=int(spec.get("wait_ms") or 0),
-            oldest_age_ms=_oldest_age_ms(stages),
+            oldest_age_ms=age,
         )
         if count == 0:
             client.waiting = True
+            client.note_filling(age, int(spec.get("wait_ms") or 0))
             return False
         stages = stages[:count]
     client.waiting = False
@@ -412,7 +437,7 @@ def _loop(client: WorkerClient, *, once: bool, interval: float, copies: int = 1)
         if once and ran:
             return
         if not ran:
-            time.sleep(0.05 if client.waiting else interval)
+            time.sleep(client.pause(interval))
 
 
 def baked_runtime() -> tuple[str, str, str]:

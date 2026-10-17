@@ -149,6 +149,17 @@ class Job:
             time.sleep(interval)
 
 
+# Over the organization's request rate, submit waits as Surfra asks, this many times.
+RATE_RETRIES = 5
+
+
+def _retry_after(response: httpx.Response) -> float:
+    try:
+        return min(60.0, max(1.0, float(response.headers.get("retry-after") or 1)))
+    except ValueError:
+        return 1.0
+
+
 class SurfraClient:
     """HTTP client for the Surfra API.
 
@@ -226,10 +237,13 @@ class SurfraClient:
     def submit(self, stages: list[dict[str, Any]], *, metadata: dict[str, Any] | None = None, callback_url: str | None = None) -> dict[str, Any]:
         """Start a transaction. Each stage names an app and lists the stages it depends on."""
 
-        return _checked(self._http.post(
-            f"{self.base_url}/v1/transactions",
-            json={"stages": stages, "metadata": metadata or {}, "callback_url": callback_url},
-        ))
+        body = {"stages": stages, "metadata": metadata or {}, "callback_url": callback_url}
+        for attempt in range(RATE_RETRIES + 1):
+            response = self._http.post(f"{self.base_url}/v1/transactions", json=body)
+            if response.status_code != 429 or attempt == RATE_RETRIES:
+                return _checked(response)
+            time.sleep(_retry_after(response))
+        raise AssertionError("unreachable")
 
     def transaction(self, transaction_id: str) -> dict[str, Any]:
         return _checked(self._http.get(f"{self.base_url}/v1/transactions/{transaction_id}"))
