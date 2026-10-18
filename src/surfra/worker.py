@@ -18,7 +18,7 @@ from typing import Any
 
 import httpx
 
-from surfra import logship
+from surfra import logship, usage
 from surfra.runner import load_app, run_handler_batch, run_warmup
 from surfra.sdk import adopt_handler_spec, bind_progress_hook, registered_handler_spec, take_batch, unbind_progress_hook
 
@@ -457,6 +457,7 @@ def baked_runtime() -> tuple[str, str, str]:
 def main() -> None:
     master, token, app_path = baked_runtime()
     logship.start(master, token)
+    usage.start(master, token)
     logship.note(f"worker starting, loading {app_path}")
     once = os.environ.get("SURFRA_ONCE", "").strip().lower() in {"1", "true", "yes"}
     serve(master, token, app_path, once=once)
