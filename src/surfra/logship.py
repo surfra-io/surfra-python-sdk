@@ -42,6 +42,13 @@ def note(message: str) -> None:
         _shipper.note(message)
 
 
+def flush(timeout: float = 60.0) -> None:
+    """Send what is buffered. Used before the process exits."""
+
+    if _shipper is not None:
+        _shipper.flush(timeout)
+
+
 @contextmanager
 def running(request_ids: Iterable[str | None]) -> Iterator[None]:
     """Lines printed inside this block are tagged with the request, when only one is running."""

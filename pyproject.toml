@@ -1,6 +1,6 @@
 [project]
 name = "surfra"
-version = "0.2.2"
+version = "0.2.3"
 description = "Surfra Python SDK. Users own the model. The worker runs it."
 readme = "README.md"
 license = "Apache-2.0"

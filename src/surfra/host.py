@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -17,7 +18,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 from surfra import update
-from surfra.box import open_box
+from surfra.box import SEAL_VERSION, box_context, open_box
 from surfra.cli import open_page
 
 HOME = Path.home() / ".surfra"
@@ -38,8 +39,16 @@ def _read(path: Path) -> dict:
 
 
 def _write(path: Path, body: dict) -> None:
+    """Tokens and the runner's private key live here. Created owner-only, never briefly readable."""
+
     HOME.mkdir(mode=0o700, exist_ok=True)
-    path.write_text(json.dumps(body, indent=2) + "\n")
+    try:
+        HOME.chmod(0o700)
+    except OSError:
+        pass
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps(body, indent=2) + "\n")
     path.chmod(0o600)
 
 
@@ -268,7 +277,7 @@ def start() -> int:
                 checked = time.monotonic()
                 told = _pick_up_update(told)
             try:
-                response = http.post(f"{master}/v1/runners/heartbeat")
+                response = http.post(f"{master}/v1/runners/heartbeat", json={"seal": SEAL_VERSION})
             except httpx.HTTPError as exc:
                 print(f"cannot reach {master}: {exc}. Retrying.", file=sys.stderr)
                 time.sleep(10)
@@ -312,7 +321,8 @@ def _run_assignment(http: httpx.Client, master: str, saved: dict, assignment: di
     def beat() -> None:
         while not stop.wait(20):
             try:
-                response = http.post(f"{master}/v1/runners/heartbeat")
+                # Brief: only which assignment is current. Secrets are not sent again.
+                response = http.post(f"{master}/v1/runners/heartbeat", json={"seal": SEAL_VERSION, "brief": True})
                 current = response.json().get("assignment") if response.is_success else None
             except (httpx.HTTPError, ValueError):
                 continue
@@ -358,13 +368,50 @@ def _container_running(name: str) -> bool:
     return found.returncode == 0 and found.stdout.strip() == "true"
 
 
-def _pull(image: str) -> None:
-    if subprocess.run(["docker", "pull", image], check=False).returncode == 0:
+def _pull(image: str, *, env: dict[str, str] | None = None) -> None:
+    if subprocess.run(["docker", "pull", image], check=False, env=env).returncode == 0:
         return
     if subprocess.run(["docker", "image", "inspect", image], capture_output=True, check=False).returncode == 0:
         print(f"could not pull {image}. Using the copy already on this machine.", flush=True)
         return
     raise RuntimeError(f"could not pull {image}, and this machine has no copy of it")
+
+
+# Names the docker CLI itself reads. Passing an app value for these through the CLI's own
+# environment would change what the CLI does, so they go on the command line. They are not secrets.
+_CLI_NAMES = ("PATH", "HOME")
+
+
+def _secrets(saved: dict, assignment: dict) -> tuple[dict[str, str], str]:
+    """The app env and registry password, opened in memory. Nothing here is written to disk."""
+
+    replica = str(assignment.get("replica_id") or "")
+    runner = str(saved.get("id") or "")
+    if assignment.get("env_box"):
+        env = json.loads(open_box(saved["private_key"], assignment["env_box"], box_context(runner, replica, "env")))
+    else:
+        env = dict(assignment.get("env") or {})
+    sealed = assignment.get("docker_password_box") or ""
+    password = open_box(saved["private_key"], sealed, box_context(runner, replica, "docker_password")) if sealed else ""
+    return {str(key): str(value) for key, value in env.items()}, password
+
+
+def _docker_command(base: list[str], env: dict[str, str]) -> tuple[list[str], dict[str, str]]:
+    """docker run arguments that name each variable, and the CLI environment that holds the values.
+
+    `docker run -e NAME` takes the value from the CLI's own environment, so secrets never appear in
+    the process list or /proc/*/cmdline, which any user on the machine can read.
+    """
+
+    command = list(base)
+    cli_env = dict(os.environ)
+    for key, value in env.items():
+        if key in _CLI_NAMES or key.startswith("DOCKER_"):
+            command.extend(["-e", f"{key}={value}"])
+            continue
+        cli_env[key] = value
+        command.extend(["-e", key])
+    return command, cli_env
 
 
 def _docker(saved: dict, assignment: dict) -> None:
@@ -374,40 +421,45 @@ def _docker(saved: dict, assignment: dict) -> None:
         print(f"picking up job {job}, which is still running in {name}", flush=True)
         subprocess.run(["docker", "wait", name], capture_output=True, check=False)
         return
-    password = ""
-    if assignment.get("docker_password_box"):
-        password = open_box(saved["private_key"], assignment["docker_password_box"])
+    env, password = _secrets(saved, assignment)
+    docker = shutil.which("docker") or "docker"
     server = str(assignment.get("docker_server") or "").removeprefix("https://").removeprefix("http://").strip("/")
-    if password and assignment.get("docker_user"):
-        login = ["docker", "login", "-u", assignment["docker_user"], "--password-stdin"]
-        if server:
-            login.append(server)
-        subprocess.run(login, input=password, text=True, check=True)
     image = assignment["image"]
-    _pull(image)
-    subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
+    if password and assignment.get("docker_user"):
+        # Log in to a throwaway config for this pull only, so the registry password is not left in ~/.docker.
+        with tempfile.TemporaryDirectory(prefix="surfra-docker-") as config:
+            os.chmod(config, 0o700)
+            pull_env = {**os.environ, "DOCKER_CONFIG": config}
+            login = [docker, "login", "-u", assignment["docker_user"], "--password-stdin"]
+            if server:
+                login.append(server)
+            subprocess.run(login, input=password, text=True, check=True, env=pull_env, stdout=subprocess.DEVNULL)
+            _pull(image, env=pull_env)
+    else:
+        _pull(image)
+    password = ""
+    subprocess.run([docker, "rm", "-f", name], capture_output=True, check=False)
     # A job runs detached, so restarting or updating the runner never stops it.
-    command = ["docker", "run", "-d" if job else "--rm", "--init", "--name", name]
+    command = [docker, "run", "-d" if job else "--rm", "--init", "--name", name]
     if job:
         command.extend(["--rm", "--label", f"surfra.job={job}", "--stop-timeout", str(_stop_seconds(assignment))])
     if assignment.get("gpus"):
         command.extend(["--gpus", "all"])
     if os.environ.get("SURFRA_DOCKER_NETWORK"):
         command.extend(["--network", os.environ["SURFRA_DOCKER_NETWORK"]])
-    for key, value in (assignment.get("env") or {}).items():
-        command.extend(["-e", f"{key}={value}"])
+    command, cli_env = _docker_command(command, env)
     command.append(image)
     command.extend(assignment.get("command") or ["surfra", "worker"])
     if job:
         print(f"running job {job} from {image}", flush=True)
-        subprocess.run(command, stdout=subprocess.DEVNULL, check=True)
-        subprocess.run(["docker", "wait", name], capture_output=True, check=False)
+        subprocess.run(command, stdout=subprocess.DEVNULL, check=True, env=cli_env)
+        subprocess.run([docker, "wait", name], capture_output=True, check=False)
         return
     print(f"running {assignment.get('app_name')} from {image}")
     try:
-        subprocess.run(command, check=False)
+        subprocess.run(command, check=False, env=cli_env)
     finally:
-        subprocess.run(["docker", "stop", "-t", "10", name], capture_output=True, check=False)
+        subprocess.run([docker, "stop", "-t", "10", name], capture_output=True, check=False)
 
 
 def _exit_on_term(_signum: int, _frame: object) -> None:

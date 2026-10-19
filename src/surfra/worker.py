@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import queue
+import random
+import signal
 import threading
 import time
 from datetime import datetime, timezone
@@ -25,6 +28,91 @@ from surfra.sdk import adopt_handler_spec, bind_progress_hook, registered_handle
 _BAKED = ("SURFRA_MASTER", "SURFRA_REPLICA_TOKEN", "SURFRA_ENTRYPOINT")
 # An idle poll waits on Surfra this long for work, so a worker does not ask every few seconds.
 POLL_WAIT = 20.0
+# A busy worker tells Surfra it is alive this often. Surfra counts a worker silent after 45 seconds.
+HEARTBEAT_SECONDS = 15.0
+# The Go supervisor stops a request after 20 minutes unless the app sets execution_timeout_sec.
+DEFAULT_EXECUTION_TIMEOUT = 1200.0
+# How long a replacement worker process may take to load the app before the container restarts.
+RESTART_READY_SECONDS = 900.0
+
+
+def execution_timeout() -> float:
+    """Seconds one request may run. 0 turns the limit off."""
+
+    raw = os.environ.get("SURFRA_EXECUTION_TIMEOUT", "").strip()
+    try:
+        return max(0.0, float(raw)) if raw else DEFAULT_EXECUTION_TIMEOUT
+    except ValueError:
+        return DEFAULT_EXECUTION_TIMEOUT
+
+
+class Heartbeat:
+    """Keeps a busy worker's heartbeat and leases fresh while a handler runs.
+
+    Runs on its own thread with its own HTTP client, so a handler that holds the GIL in C
+    code or keeps a GPU busy for an hour does not stop the worker from reporting in. It
+    also watches the execution timeout and calls on_timeout once when a request runs past it.
+    """
+
+    def __init__(
+        self,
+        client: "WorkerClient",
+        held: int,
+        *,
+        timeout: float | None = None,
+        on_timeout: Any = None,
+        interval: float | None = None,
+    ):
+        self.client = client
+        self.held = max(1, held)
+        self.timeout = execution_timeout() if timeout is None else timeout
+        self.on_timeout = on_timeout
+        self.interval = HEARTBEAT_SECONDS if interval is None else interval
+        self.started = time.monotonic()
+        self.timed_out = False
+        self.lost = False
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="surfra-heartbeat", daemon=True)
+
+    def __enter__(self) -> "Heartbeat":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+    def _run(self) -> None:
+        next_beat = time.monotonic() + self.interval
+        while not self._stop.is_set():
+            now = time.monotonic()
+            if self.timeout and not self.timed_out and now - self.started >= self.timeout:
+                self.timed_out = True
+                logship.note(f"request ran past the execution timeout of {self.timeout:.0f}s")
+                if self.on_timeout is not None:
+                    try:
+                        self.on_timeout()
+                    except Exception as exc:
+                        logship.note(f"stopping the timed-out request failed: {exc}")
+            if now >= next_beat and not self.lost:
+                next_beat = now + self.interval
+                try:
+                    self.client.heartbeat(self.held)
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code == 401:
+                        # Surfra already gave this work to another worker. Results from here are discarded.
+                        self.lost = True
+                        logship.note("Surfra dropped this worker while it was busy. Its results will be discarded.")
+                except Exception:
+                    # A missed beat is fine. Surfra allows three before it gives the work away.
+                    pass
+            deadline = next_beat
+            if self.timeout and not self.timed_out:
+                deadline = min(deadline, self.started + self.timeout)
+            self._stop.wait(max(0.05, min(1.0, deadline - time.monotonic())))
 
 
 class WorkerClient:
@@ -36,6 +124,8 @@ class WorkerClient:
         self.backoff = 1.0
         self._pause: float | None = None
         self._http = httpx.Client(timeout=60)
+        # httpx clients are not shared across threads, so heartbeats get their own.
+        self._beat_http = httpx.Client(timeout=10)
 
     def pause(self, interval: float) -> float:
         """Seconds to sleep after a step that ran nothing."""
@@ -52,18 +142,33 @@ class WorkerClient:
 
         self._pause = min(0.25, max(0.05, (wait_ms - oldest_age_ms) / 1000)) if oldest_age_ms < wait_ms else 0.25
 
-    def register(self, concurrent_workers: int = 1, *, wait: float = 15.0) -> str:
+    def register(self, concurrent_workers: int = 1, *, wait: float = 15.0, outage: float = 300.0) -> str:
         # The control plane can start a worker before the replica row commits as ready.
         deadline = time.monotonic() + wait
+        # A control plane that is restarting or unreachable gets a few minutes, like the Go supervisor.
+        give_up = time.monotonic() + outage
+        backoff = 1.0
         while True:
-            response = self._http.post(
-                f"{self.master}/v1/workers/register",
-                json={"replica_token": self.replica_token, "concurrent_workers": concurrent_workers},
-            )
+            try:
+                response = self._http.post(
+                    f"{self.master}/v1/workers/register",
+                    json={"replica_token": self.replica_token, "concurrent_workers": concurrent_workers},
+                )
+            except httpx.TransportError:
+                if time.monotonic() >= give_up:
+                    raise
+                time.sleep(backoff * random.uniform(0.5, 1.5))
+                backoff = min(backoff * 2, 30.0)
+                continue
             unknown = response.status_code == 401 and "unknown replica token" in response.text
-            if not unknown or time.monotonic() >= deadline:
-                break
-            time.sleep(0.5)
+            if unknown and time.monotonic() < deadline:
+                time.sleep(0.5)
+                continue
+            if (response.status_code >= 500 or response.status_code == 429) and time.monotonic() < give_up:
+                time.sleep(backoff * random.uniform(0.5, 1.5))
+                backoff = min(backoff * 2, 30.0)
+                continue
+            break
         response.raise_for_status()
         self.worker_id = response.json()["worker_id"]
         return self.worker_id
@@ -89,7 +194,8 @@ class WorkerClient:
         except httpx.TransportError as exc:
             reason = type(exc).__name__
         logship.note(f"control plane unavailable ({reason}), retrying in {self.backoff:.0f}s")
-        time.sleep(self.backoff)
+        # Jitter keeps every replica from retrying in the same second after an outage.
+        time.sleep(self.backoff * random.uniform(0.5, 1.5))
         self.backoff = min(self.backoff * 2, 30.0)
         return False
 
@@ -105,6 +211,23 @@ class WorkerClient:
             return stages
         stage = body.get("stage")
         return [stage] if stage else []
+
+    def heartbeat(self, held: int) -> None:
+        """Report in without taking work. Refreshes the leases on what this worker holds."""
+
+        response = self._beat_http.post(
+            f"{self.master}/v1/workers/next",
+            json={
+                "replica_token": self.replica_token,
+                "worker_id": self.worker_id,
+                # Never more than this worker holds, so an older control plane that ignores claim hands out nothing new.
+                "limit": max(1, held),
+                "wait": 0,
+                "held": "ids",
+                "claim": False,
+            },
+        )
+        response.raise_for_status()
 
     def next_stage(self) -> dict[str, Any] | None:
         stages = self.next_stages(1)
@@ -132,12 +255,29 @@ class WorkerClient:
         except Exception:
             return
 
-    def fail(self, stage_id: str, error: str) -> None:
+    def fail(self, stage_id: str, error: str, *, counts: bool = True) -> None:
         response = self._http.post(
             f"{self.master}/v1/workers/fail",
-            json={"replica_token": self.replica_token, "worker_id": self.worker_id, "stage_id": stage_id, "error": error},
+            json={"replica_token": self.replica_token, "worker_id": self.worker_id, "stage_id": stage_id, "error": error, "counts": counts},
         )
         response.raise_for_status()
+
+    def settle(self, stages: list[dict[str, Any]], *, outputs: list[Any] | None = None, error: str | None = None) -> None:
+        """Report every stage of a batch. One stage Surfra already took back does not lose the rest."""
+
+        for index, stage in enumerate(stages):
+            try:
+                if error is not None:
+                    self.fail(stage["id"], error)
+                else:
+                    self.complete(stage["id"], (outputs or [])[index])
+            except httpx.HTTPStatusError as exc:
+                status, text = exc.response.status_code, exc.response.text
+                if status == 409 or (status == 401 and "worker is not registered" in text):
+                    # The lease moved on: the request timed out, was retried elsewhere, or this worker was closed.
+                    logship.note(f"Surfra no longer holds request stage {stage['id']} for this worker ({status}); result discarded")
+                    continue
+                raise
 
     def step(self) -> bool:
         """Pull a batch, or one request, and run the handler."""
@@ -166,22 +306,31 @@ class WorkerClient:
             stages = stages[:count]
         self.waiting = False
         hook = bind_progress_hook(lambda fraction, _message="": [self.report_progress(stage["id"], fraction) for stage in stages])
+        timeout = execution_timeout()
+
+        def give_up() -> None:
+            # A thread cannot be stopped from outside, so the request is failed now and its result dropped later.
+            self.settle(stages, error=f"the request ran longer than the execution timeout of {timeout:.0f}s")
+
+        result: Any = None
+        failure: str | None = None
         try:
-            with logship.running(stage.get("transaction_id") for stage in stages):
-                result = run_handler_batch([stage.get("input") or {} for stage in stages])
+            with Heartbeat(self, len(stages), timeout=timeout, on_timeout=give_up) as beat:
+                with logship.running(stage.get("transaction_id") for stage in stages):
+                    result = run_handler_batch([stage.get("input") or {} for stage in stages])
         except Exception as exc:
-            for stage in stages:
-                self.fail(stage["id"], str(exc))
-            return True
+            failure = str(exc)
         finally:
             unbind_progress_hook(hook)
-        if result is None or not isinstance(result, list) or len(result) != len(stages):
-            message = "a batch handler returns one result per request, or None"
-            for stage in stages:
-                self.fail(stage["id"], message)
+        if beat.timed_out or beat.lost:
             return True
-        for stage, output in zip(stages, result):
-            self.complete(stage["id"], output)
+        if failure is not None:
+            self.settle(stages, error=failure)
+            return True
+        if result is None or not isinstance(result, list) or len(result) != len(stages):
+            self.settle(stages, error="a batch handler returns one result per request, or None")
+            return True
+        self.settle(stages, outputs=result)
         return True
 
 
@@ -280,86 +429,172 @@ def _spawn_child(ctx: Any, app_path: str, jobs: Any, results: Any, mode: str, re
     return process
 
 
+class _StartFailed(RuntimeError):
+    """Worker processes could not start. The parent may run the app itself instead."""
+
+
+def _stop_process(process: Any) -> None:
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=5)
+
+
+def _await_ready(source: Any, processes: list[Any], timeout: float) -> dict[str, Any]:
+    """The next ready message. Fails when every process died first or the time runs out."""
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            message = source.get(timeout=1.0)
+        except queue.Empty:
+            if processes and not any(process.is_alive() for process in processes):
+                codes = ", ".join(str(process.exitcode) for process in processes)
+                raise _StartFailed(f"worker process exited while loading the app (exit code {codes})")
+            continue
+        if isinstance(message, dict) and message.get("kind") == "ready":
+            return message
+    raise _StartFailed(f"worker process did not finish loading the app within {timeout:.0f}s")
+
+
+class _Slot:
+    """One worker process and its job queue. A process that hangs or dies is replaced in place."""
+
+    def __init__(self, ctx: Any, app_path: str, mode: str, replica_token: str, results: Any, ready: "queue.Queue[dict[str, Any]]"):
+        self.ctx = ctx
+        self.app_path = app_path
+        self.mode = mode
+        self.replica_token = replica_token
+        self.results = results
+        self.ready = ready
+        self.lock = threading.Lock()
+        self.generation = 0
+        self.jobs = ctx.Queue()
+        self.process = _spawn_child(ctx, app_path, self.jobs, results, mode, replica_token)
+
+    def restart(self, generation: int, why: str) -> None:
+        with self.lock:
+            if generation != self.generation:
+                return
+            logship.note(f"restarting a worker process because {why}")
+            _stop_process(self.process)
+            self.jobs = self.ctx.Queue()
+            self.process = _spawn_child(self.ctx, self.app_path, self.jobs, self.results, self.mode, self.replica_token)
+            try:
+                _await_ready(self.ready, [self.process], RESTART_READY_SECONDS)
+            except _StartFailed as exc:
+                # Nothing can serve on this replica now. Exit so the container restarts clean.
+                logship.note(f"the replacement worker process did not start: {exc}. Restarting the container.")
+                logship.flush(timeout=10)
+                os._exit(1)
+            self.generation += 1
+            logship.note("worker process restarted")
+
+
+def _collect(
+    results: Any,
+    ready: "queue.Queue[dict[str, Any]]",
+    pending: dict[str, dict[str, Any]],
+    answers: dict[str, dict[str, Any]],
+    lock: threading.Lock,
+) -> None:
+    """Route messages from worker processes: answers to the waiting request, ready to a restart."""
+
+    while True:
+        message = results.get()
+        if not isinstance(message, dict):
+            continue
+        kind = message.get("kind")
+        if kind == "ready":
+            ready.put(message)
+            continue
+        if kind == "progress":
+            with lock:
+                job = pending.get(message["id"])
+            if job is not None:
+                for stage in job["stages"]:
+                    job["client"].report_progress(stage["id"], float(message["fraction"]))
+            continue
+        if kind != "done":
+            continue
+        with lock:
+            job = pending.get(message["id"])
+            # An answer for a request already given up on (timed out, process restarted) is dropped.
+            if job is not None:
+                answers[message["id"]] = message
+        if job is not None:
+            job["event"].set()
+
+
 def _serve_supervised(master: str, replica_token: str, app_path: str, *, once: bool, interval: float) -> None:
     mode = deployment_mode()
     ctx = multiprocessing.get_context("spawn")
     results = ctx.Queue()
-    first_jobs = ctx.Queue()
+    ready: "queue.Queue[dict[str, Any]]" = queue.Queue()
     began = time.monotonic()
-    process = _spawn_child(ctx, app_path, first_jobs, results, mode, replica_token)
-    ready = results.get()
-    if ready.get("kind") != "ready":
-        process.terminate()
-        raise RuntimeError("worker child did not start")
-    logship.note(f"{app_path} loaded and warmed up in {time.monotonic() - began:.1f}s")
-    adopt_handler_spec(ready["spec"])
-    spec = registered_handler_spec() or {}
-    copies = max(1, int(spec.get("concurrent_workers") or 1))
-    queues = [first_jobs]
-    processes = [process]
-    if mode == "isolated" and copies > 1:
-        for _ in range(copies - 1):
-            jobs = ctx.Queue()
-            processes.append(_spawn_child(ctx, app_path, jobs, results, mode, replica_token))
-            queues.append(jobs)
-        for _ in range(copies - 1):
-            extra = results.get()
-            if extra.get("kind") != "ready":
-                raise RuntimeError("worker child did not start")
-    clients = [WorkerClient(master, replica_token) for _ in range(copies)]
-    for client in clients:
-        client.register(copies)
-    pending: dict[str, dict[str, Any]] = {}
-    answers: dict[str, dict[str, Any]] = {}
-    lock = threading.Lock()
+    slots: list[_Slot] = []
+    try:
+        slots.append(_Slot(ctx, app_path, mode, replica_token, results, ready))
+    except Exception as exc:
+        raise _StartFailed(f"could not start a worker process: {exc}") from exc
+    try:
+        first = _await_ready(results, [slots[0].process], RESTART_READY_SECONDS)
+        logship.note(f"{app_path} loaded and warmed up in {time.monotonic() - began:.1f}s")
+        adopt_handler_spec(first["spec"])
+        spec = registered_handler_spec() or {}
+        copies = max(1, int(spec.get("concurrent_workers") or 1))
+        if mode == "isolated" and copies > 1:
+            for _ in range(copies - 1):
+                slots.append(_Slot(ctx, app_path, mode, replica_token, results, ready))
+            for _ in range(copies - 1):
+                _await_ready(results, [slot.process for slot in slots[1:]], RESTART_READY_SECONDS)
+    except BaseException:
+        for slot in slots:
+            _stop_process(slot.process)
+        raise
+    # From here a child holds the model, so a failure must not load it again in this process.
+    try:
+        clients = [WorkerClient(master, replica_token) for _ in range(copies)]
+        for client in clients:
+            client.register(copies)
+        pending: dict[str, dict[str, Any]] = {}
+        answers: dict[str, dict[str, Any]] = {}
+        lock = threading.Lock()
 
-    def collect() -> None:
-        while True:
-            message = results.get()
-            if not isinstance(message, dict):
-                continue
-            if message.get("kind") == "progress":
-                with lock:
-                    job = pending.get(message["id"])
-                if job is not None:
-                    for stage in job["stages"]:
-                        job["client"].report_progress(stage["id"], float(message["fraction"]))
-                continue
-            if message.get("kind") != "done":
-                continue
-            with lock:
-                job = pending.get(message["id"])
-                answers[message["id"]] = message
-            if job is not None:
-                job["event"].set()
+        threading.Thread(target=_collect, args=(results, ready, pending, answers, lock), daemon=True).start()
 
-    threading.Thread(target=collect, daemon=True).start()
+        def loop(client: WorkerClient, slot: _Slot) -> None:
+            while True:
+                ran = client.guard(lambda: _step_remote(client, slot, pending, answers, lock), copies)
+                if once and ran:
+                    return
+                if not ran:
+                    time.sleep(client.pause(interval))
 
-    def loop(client: WorkerClient, jobs: Any) -> None:
-        while True:
-            ran = client.guard(lambda: _step_remote(client, jobs, pending, answers, lock), copies)
-            if once and ran:
-                return
-            if not ran:
-                time.sleep(client.pause(interval))
-
-    threads = [
-        threading.Thread(target=loop, args=(client, queues[index % len(queues)]), daemon=True)
-        for index, client in enumerate(clients)
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    for jobs in queues:
-        jobs.put(None)
-    for process in processes:
-        process.join(timeout=5)
+        threads = [
+            threading.Thread(target=loop, args=(client, slots[index % len(slots)]), daemon=True)
+            for index, client in enumerate(clients)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        for slot in slots:
+            try:
+                slot.jobs.put(None)
+            except Exception:
+                pass
+        for slot in slots:
+            slot.process.join(timeout=5)
+            _stop_process(slot.process)
 
 
 def _step_remote(
     client: WorkerClient,
-    jobs: Any,
+    slot: _Slot,
     pending: dict[str, dict[str, Any]],
     answers: dict[str, dict[str, Any]],
     lock: threading.Lock,
@@ -391,23 +626,42 @@ def _step_remote(
     event = threading.Event()
     with lock:
         pending[job_id] = {"event": event, "client": client, "stages": stages}
-    with logship.running(stage.get("transaction_id") for stage in stages):
-        jobs.put({"id": job_id, "payloads": [stage.get("input") or {} for stage in stages]})
-        event.wait()
+    timeout = execution_timeout()
+    generation = slot.generation
+    reason: str | None = None
+    restart = False
+    with Heartbeat(client, len(stages), timeout=timeout) as beat:
+        with logship.running(stage.get("transaction_id") for stage in stages):
+            slot.jobs.put({"id": job_id, "payloads": [stage.get("input") or {} for stage in stages]})
+            while not event.wait(1.0):
+                if beat.timed_out:
+                    reason, restart = f"the request ran longer than the execution timeout of {timeout:.0f}s", True
+                    break
+                if slot.generation != generation:
+                    reason = "its worker process was restarted while it ran"
+                    break
+                if not slot.process.is_alive():
+                    reason, restart = f"its worker process exited (exit code {slot.process.exitcode})", True
+                    break
     with lock:
-        message = answers.pop(job_id)
+        message = answers.pop(job_id, None)
         pending.pop(job_id, None)
+    if beat.lost:
+        return True
+    if reason is not None:
+        client.settle(stages, error=reason)
+        if restart:
+            slot.restart(generation, reason)
+        return True
+    assert message is not None
     if message.get("error"):
-        for stage in stages:
-            client.fail(stage["id"], message["error"])
+        client.settle(stages, error=message["error"])
         return True
     result = message.get("output")
     if result is None or not isinstance(result, list) or len(result) != len(stages):
-        for stage in stages:
-            client.fail(stage["id"], "a batch handler returns one result per request, or None")
+        client.settle(stages, error="a batch handler returns one result per request, or None")
         return True
-    for stage, output in zip(stages, result):
-        client.complete(stage["id"], output)
+    client.settle(stages, outputs=result)
     return True
 
 
@@ -418,7 +672,7 @@ def serve(master: str, replica_token: str, app_path: str, *, once: bool = False,
         return
     try:
         _serve_supervised(master, replica_token, app_path, once=once, interval=interval)
-    except Exception as exc:
+    except _StartFailed as exc:
         print(f"worker processes failed to start ({exc}); running in this process", flush=True)
         _serve_in_process(master, replica_token, app_path, once=once, interval=interval)
 
@@ -440,6 +694,21 @@ def _loop(client: WorkerClient, *, once: bool, interval: float, copies: int = 1)
             time.sleep(client.pause(interval))
 
 
+def _flush_on_term() -> None:
+    """A stop sends SIGTERM. Ship the last log lines, which usually explain the stop, before exiting."""
+
+    def stop(signum: int, _frame: Any) -> None:
+        logship.note("worker stopping")
+        logship.flush(timeout=10)
+        raise SystemExit(128 + signum)
+
+    try:
+        signal.signal(signal.SIGTERM, stop)
+    except ValueError:
+        # Not the main thread, as in tests.
+        pass
+
+
 def baked_runtime() -> tuple[str, str, str]:
     """Master, replica token, and entrypoint. All three are process env, not flags."""
 
@@ -457,6 +726,7 @@ def baked_runtime() -> tuple[str, str, str]:
 def main() -> None:
     master, token, app_path = baked_runtime()
     logship.start(master, token)
+    _flush_on_term()
     usage.start(master, token)
     logship.note(f"worker starting, loading {app_path}")
     once = os.environ.get("SURFRA_ONCE", "").strip().lower() in {"1", "true", "yes"}
