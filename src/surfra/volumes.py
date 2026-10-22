@@ -29,6 +29,12 @@ import httpx
 from surfra.client import SurfraError
 
 PART_BYTES = 64 * 1024 * 1024
+
+
+def _part_bytes() -> int:
+    """The largest single upload. SURFRA_VOLUMES_PART_BYTES lowers it, for tests."""
+
+    return int(os.environ.get("SURFRA_VOLUMES_PART_BYTES") or PART_BYTES)
 DOWNLOADS = 8
 UPLOADS = 4
 MODES = ("r", "w", "rw")
@@ -248,7 +254,7 @@ class Volume:
 
         source = Path(local)
         size = source.stat().st_size
-        if size <= PART_BYTES:
+        if size <= _part_bytes():
             headers = {"Content-Length": str(size)}
             if if_match:
                 headers["If-Match"] = if_match
@@ -360,7 +366,7 @@ class Volume:
                 list(pool.map(fetch, changed))
             for entry in changed:
                 local = root / entry.path
-                state[entry.path] = {"etag": entry.etag, "size": entry.size, "mtime": local.stat().st_mtime}
+                state[entry.path] = {"etag": entry.etag, "size": entry.size, "mtime_ns": local.stat().st_mtime_ns}
             scope = path if folder else None
             for known in list(state):
                 inside = known.startswith(scope) if scope is not None else known == path
@@ -407,10 +413,10 @@ class Volume:
                     seen.add(remote)
                     stat = item.stat()
                     known = state.get(remote)
-                    if known and known["size"] == stat.st_size and known["mtime"] == stat.st_mtime:
+                    if known and known["size"] == stat.st_size and known.get("mtime_ns") == stat.st_mtime_ns:
                         continue
                     entry = self.put_file(item, remote)
-                    state[remote] = {"etag": entry.etag, "size": entry.size, "mtime": stat.st_mtime}
+                    state[remote] = {"etag": entry.etag, "size": entry.size, "mtime_ns": stat.st_mtime_ns}
                     uploaded += 1
                 if mode == "rw":
                     for known in [key for key in state if (key.startswith(path) if folder else key == path)]:
@@ -434,7 +440,7 @@ def _stale(local: Path, known: dict[str, Any] | None, entry: Entry) -> bool:
     if not known or known.get("etag") != entry.etag or not local.is_file():
         return True
     stat = local.stat()
-    return stat.st_size != entry.size or stat.st_mtime != known.get("mtime")
+    return stat.st_size != entry.size or stat.st_mtime_ns != known.get("mtime_ns")
 
 
 class _Upload(io.RawIOBase):

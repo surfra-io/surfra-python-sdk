@@ -165,7 +165,7 @@ def test_open_reads_and_writes_single_files(fake):
 
 
 def test_large_files_upload_in_parts(fake, tmp_path, monkeypatch):
-    monkeypatch.setattr(volumes, "PART_BYTES", 4)
+    monkeypatch.setenv("SURFRA_VOLUMES_PART_BYTES", "4")
     fake.part_size = 4
     source = tmp_path / "big.bin"
     source.write_bytes(b"0123456789")
