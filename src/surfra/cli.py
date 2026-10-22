@@ -57,8 +57,10 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     from surfra.jobcli import build as build_jobs
+    from surfra.volumecli import build as build_volumes
 
     build_jobs(sub)
+    build_volumes(sub)
 
     args = parser.parse_args(argv)
     if args.command == "worker":
@@ -81,6 +83,10 @@ def main(argv: list[str] | None = None) -> None:
         from surfra.jobcli import run as run_job
 
         raise SystemExit(run_job(args))
+    if args.command == "volume":
+        from surfra.volumecli import run as run_volume
+
+        raise SystemExit(run_volume(args))
     if args.command == "runner" and args.runner_command == "install":
         raise SystemExit(_install(args.kind))
     from surfra.host import register, service, start, stop, whoami

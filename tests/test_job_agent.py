@@ -21,6 +21,7 @@ class FakeSurfra:
         self.finished: list[dict] = []
         self.lines: list[dict] = []
         self.beats = 0
+        self.token_auth = None
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -42,6 +43,9 @@ class FakeSurfra:
                 elif self.path == "/v1/jobs/agent/finish":
                     fake.finished.append(json.loads(body))
                     self._json({"status": "ok"})
+                elif self.path == "/v1/tokens":
+                    fake.token_auth = self.headers.get("Authorization")
+                    self._json({"token": "aaa.bbb.ccc"})
                 elif self.path == "/v1/workers/logs":
                     time.sleep(fake.logs_delay)
                     if fake.logs_status == 200:
@@ -162,3 +166,14 @@ def test_overlapping_flushes_send_each_line_once(surfra, tmp_path):
         thread.join()
     sent = fake.messages("out")
     assert sorted(sent) == sorted(f"line {index}" for index in range(50))
+
+
+def test_any_command_reaches_volumes_without_the_replica_token(surfra, tmp_path, monkeypatch):
+    monkeypatch.delenv("SURFRA_VOLUMES_TOKEN_FILE", raising=False)
+    monkeypatch.setenv("SURFRA_REPLICA_TOKEN", "sfp_test")
+    fake = surfra(_plan('cat "$SURFRA_VOLUMES_TOKEN_FILE"; echo; echo "url=$SURFRA_VOLUMES_URL"; echo "replica=${SURFRA_REPLICA_TOKEN:-none}"'))
+    code = Agent(fake.url, "sfp_test", log_dir=str(tmp_path), heartbeat=0.2).run()
+    assert code == 0
+    out = fake.messages("out")
+    assert "aaa.bbb.ccc" in out and "url=https://volumes.surfra.io" in out and "replica=none" in out
+    assert fake.token_auth == "Bearer sfp_test"

@@ -30,6 +30,7 @@ class Agent:
     def __init__(self, master: str, token: str, *, log_dir: str | None = None, heartbeat: float | None = None):
         self.master = master.rstrip("/")
         self.token = token
+        self.volume_tokens = None
         self.http = httpx.Client(timeout=30, headers={"X-Surfra-Replica-Token": token})
         self.heartbeat = heartbeat
         self.grace = 30.0
@@ -87,6 +88,12 @@ class Agent:
         deadline = plan.get("deadline_at")
         env = dict(os.environ)
         env.pop("SURFRA_REPLICA_TOKEN", None)
+        if self.volume_tokens is None:
+            from surfra.volumes import start_token_file
+
+            self.volume_tokens = start_token_file(self.master, self.token)
+        env["SURFRA_VOLUMES_TOKEN_FILE"] = os.environ.get("SURFRA_VOLUMES_TOKEN_FILE", "")
+        env["SURFRA_VOLUMES_URL"] = os.environ.get("SURFRA_VOLUMES_URL", "")
         shell = "/bin/bash" if os.path.exists("/bin/bash") else "/bin/sh"
         self.say(f"running: {command}")
         began = time.monotonic()

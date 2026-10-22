@@ -535,6 +535,11 @@ def _serve_supervised(master: str, replica_token: str, app_path: str, *, once: b
     ready: "queue.Queue[dict[str, Any]]" = queue.Queue()
     began = time.monotonic()
     slots: list[_Slot] = []
+    # User code never sees the replica token. It reaches volumes with a volumes-only token
+    # this process keeps fresh in a file, named by SURFRA_VOLUMES_TOKEN_FILE.
+    from surfra.volumes import start_token_file
+
+    start_token_file(master, replica_token)
     try:
         slots.append(_Slot(ctx, app_path, mode, replica_token, results, ready))
     except Exception as exc:

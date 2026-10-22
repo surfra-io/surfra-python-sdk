@@ -9,6 +9,7 @@ from surfra.client import Call, Job, SurfraClient, SurfraError
 from surfra.credentials import Credentials
 from surfra.sdk import Request, batch_size, handler, progress, stage, warmup
 from surfra.types import Autoscale, ProviderRow, Runtime
+from surfra.volumes import Volume, VolumePath
 
 __all__ = [
     "App",
@@ -21,6 +22,8 @@ __all__ = [
     "Runtime",
     "SurfraClient",
     "SurfraError",
+    "Volume",
+    "VolumePath",
     "Workflow",
     "batch_size",
     "handler",

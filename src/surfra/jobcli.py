@@ -62,6 +62,7 @@ def add_fields(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--grace", type=duration, help="Time between SIGTERM and SIGKILL when the job is stopped. Default 30s.")
     parser.add_argument("--call-app", action="append", default=[], help="An app the job may call. Use '*' for every app. Repeatable.")
     parser.add_argument("--deny-app", action="append", default=[], help="An app the job may never call. Repeatable.")
+    parser.add_argument("--volume", action="append", default=[], metavar="NAME:MODE", help="A volume the job may reach, such as weights:r or outputs:rw. Repeatable.")
 
 
 def _fields(args: argparse.Namespace) -> dict[str, Any]:
@@ -88,6 +89,7 @@ def _fields(args: argparse.Namespace) -> dict[str, Any]:
         "grace_sec": args.grace,
         "call_apps": args.call_app or None,
         "deny_apps": args.deny_app or None,
+        "volumes": args.volume or None,
     }
     return {key: value for key, value in fields.items() if value is not None}
 

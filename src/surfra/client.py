@@ -295,6 +295,7 @@ class SurfraClient:
         grace_sec: int | None = None,
         call_apps: list[str] | None = None,
         deny_apps: list[str] | None = None,
+        volumes: list[str] | None = None,
         name: str | None = None,
         submission_id: str | None = None,
     ) -> Job:
@@ -304,6 +305,7 @@ class SurfraClient:
         providers are machine rows in order, such as [{"provider": "runner", "runner": "desk-4090"}].
         env is set in the container. Names starting with SURFRA_ are reserved.
         call_apps lists the apps the job may call with the SURFRA_API_KEY Surfra gives it. ["*"] allows all.
+        volumes lists the volumes the job may reach, such as ["weights:r", "outputs:rw"]. Missing volumes are created.
         submission_id makes the call safe to retry: the same id returns the same job.
         """
 
@@ -323,12 +325,23 @@ class SurfraClient:
                 "grace_sec": grace_sec,
                 "call_apps": call_apps,
                 "deny_apps": deny_apps,
+                "volumes": volumes,
                 "name": name,
                 "submission_id": submission_id,
             }.items()
             if value is not None
         }
         return Job(self, _checked(self._http.post(f"{self.base_url}/v1/jobs", json=body)))
+
+    def app_volumes(self, app_name: str) -> list[dict[str, str]]:
+        """The volumes an app's replicas may reach, as [{"volume", "mode"}]."""
+
+        return _checked(self._http.get(f"{self.base_url}/v1/apps/{quote(app_name, safe='')}/volumes"))["volumes"]
+
+    def set_app_volumes(self, app_name: str, volumes: list[str]) -> list[dict[str, str]]:
+        """Replace an app's volume grants, such as ["weights:r", "outputs:rw"]. Running replicas see it within 15 minutes."""
+
+        return _checked(self._http.put(f"{self.base_url}/v1/apps/{quote(app_name, safe='')}/volumes", json={"volumes": volumes}))["volumes"]
 
     def job(self, job_id: str) -> Job:
         return Job(self, _checked(self._http.get(f"{self.base_url}/v1/jobs/{job_id}")))
