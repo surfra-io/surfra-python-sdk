@@ -17,6 +17,7 @@ import json
 import os
 import tempfile
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -514,8 +515,81 @@ class VolumeTokens(threading.Thread):
             self.stop.wait(self.every if ok else 30.0)
 
 
+_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host"}
+
+
+def _proxy_handler(upstream: str, token_file: Path, client: httpx.Client) -> type[BaseHTTPRequestHandler]:
+    """Forwards each request to the volumes service, adding the volumes token unless one is already set."""
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _forward(self) -> None:
+            headers = {key: value for key, value in self.headers.items() if key.lower() not in _HOP}
+            if not any(key.lower() == "authorization" for key in headers):
+                try:
+                    headers["Authorization"] = f"Bearer {token_file.read_text().strip()}"
+                except OSError:
+                    pass
+            length = int(self.headers.get("Content-Length") or 0)
+
+            def body() -> Iterator[bytes]:
+                left = length
+                while left > 0:
+                    chunk = self.rfile.read(min(left, 1024 * 1024))
+                    if not chunk:
+                        return
+                    left -= len(chunk)
+                    yield chunk
+
+            try:
+                with client.stream(self.command, upstream + self.path, headers=headers, content=body() if length else None) as response:
+                    self.send_response(response.status_code)
+                    for key, value in response.headers.multi_items():
+                        if key.lower() not in _HOP:
+                            self.send_header(key, value)
+                    if "content-length" not in response.headers:
+                        self.send_header("Connection", "close")
+                        self.close_connection = True
+                    self.end_headers()
+                    if self.command != "HEAD":
+                        for chunk in response.iter_raw():
+                            self.wfile.write(chunk)
+            except httpx.HTTPError as exc:
+                message = json.dumps({"error": f"the volumes service could not be reached: {exc}"}).encode()
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(message)))
+                self.end_headers()
+                self.wfile.write(message)
+
+        do_GET = do_HEAD = do_PUT = do_POST = do_DELETE = _forward
+
+        def log_message(self, *_args: Any) -> None:
+            pass
+
+    return Handler
+
+
+def start_local_proxy(upstream: str, token_file: Path) -> str | None:
+    """A proxy on a loopback port that adds the volumes token, so plain requests from any language work."""
+
+    client = httpx.Client(timeout=httpx.Timeout(60.0, read=300.0))
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _proxy_handler(upstream.rstrip("/"), token_file, client))
+    except OSError:
+        return None
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True, name="surfra-volumes-proxy").start()
+    return f"http://127.0.0.1:{server.server_address[1]}"
+
+
 def start_token_file(master: str, replica_token: str) -> VolumeTokens | None:
-    """Start the refresher and point SURFRA_VOLUMES_TOKEN_FILE at its file. Returns None if it cannot write one."""
+    """Keep a volumes-only token fresh, serve the loopback proxy, and point user code at both.
+
+    SURFRA_VOLUMES_URL is the proxy, so a plain request from any language needs no credential.
+    SURFRA_VOLUMES_TOKEN_FILE holds the same token, for clients that talk to the service directly.
+    """
 
     path = Path(tempfile.gettempdir()) / "surfra" / f"volume-token-{os.getpid()}"
     try:
@@ -524,7 +598,7 @@ def start_token_file(master: str, replica_token: str) -> VolumeTokens | None:
         pass
     refresher = VolumeTokens(master, replica_token, path)
     refresher.start()
-    # Any language reaches volumes with these two: send the file's contents as a bearer token to the URL.
+    upstream = _volumes_url()
     os.environ["SURFRA_VOLUMES_TOKEN_FILE"] = str(path)
-    os.environ["SURFRA_VOLUMES_URL"] = _volumes_url()
+    os.environ["SURFRA_VOLUMES_URL"] = start_local_proxy(upstream, path) or upstream
     return refresher

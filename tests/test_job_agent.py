@@ -175,5 +175,6 @@ def test_any_command_reaches_volumes_without_the_replica_token(surfra, tmp_path,
     code = Agent(fake.url, "sfp_test", log_dir=str(tmp_path), heartbeat=0.2).run()
     assert code == 0
     out = fake.messages("out")
-    assert "aaa.bbb.ccc" in out and "url=https://volumes.surfra.io" in out and "replica=none" in out
+    assert "aaa.bbb.ccc" in out and "replica=none" in out
+    assert any(line.startswith("url=http://127.0.0.1:") for line in out)
     assert fake.token_auth == "Bearer sfp_test"

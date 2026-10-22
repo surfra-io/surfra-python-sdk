@@ -193,3 +193,39 @@ def test_grants_read_like_the_spec():
     assert Volume("weights").mode("r") == "weights:r"
     with pytest.raises(ValueError):
         Volume("weights").mode("x")
+
+
+def test_the_local_proxy_adds_the_token_for_plain_requests(tmp_path):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    seen = []
+
+    class Upstream(BaseHTTPRequestHandler):
+        def _answer(self):
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            seen.append((self.command, self.path, self.headers.get("Authorization"), body))
+            payload = b"file body"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(payload)
+
+        do_GET = do_PUT = do_HEAD = _answer
+
+        def log_message(self, *_args):
+            pass
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    token = tmp_path / "token"
+    token.write_text("aaa.bbb.ccc")
+    local = volumes.start_local_proxy(f"http://127.0.0.1:{upstream.server_address[1]}", token)
+    try:
+        assert httpx.get(f"{local}/v1/weights/files/a.bin").content == b"file body"
+        httpx.put(f"{local}/v1/weights/files/b.bin", content=b"12345", headers={"Authorization": "Bearer sfk_own"})
+        assert seen[0][:3] == ("GET", "/v1/weights/files/a.bin", "Bearer aaa.bbb.ccc")
+        assert seen[1] == ("PUT", "/v1/weights/files/b.bin", "Bearer sfk_own", b"12345")
+    finally:
+        upstream.shutdown()
