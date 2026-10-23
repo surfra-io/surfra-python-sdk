@@ -261,6 +261,12 @@ def w01_workflow_run_returns_each_stage(fake):
     assert out == {"a": {"app": "embed", "echo": {"q": "hi"}}, "b": {"app": "rerank", "echo": {}}}
 
 
+def w02_workflow_deploy_saves_stages(fake):
+    flow = surfra.Workflow("solo")
+    flow.deploy([{"name": "only", "app": "embed", "depends": []}])
+    assert flow.run({"q": "hi"}, timeout=30) == {"app": "embed", "echo": {"q": "hi"}}
+
+
 def j02_job_logs_oldest_first(fake):
     job = SurfraClient().submit_job("echo hi", image="img", providers=[{"provider": "local"}])
     assert [line["m"] for line in job.logs()] == ["line 0", "line 1", "line 2"]
@@ -268,5 +274,5 @@ def j02_job_logs_oldest_first(fake):
 
 # pytest collects test_* functions; the case names above are the shared ids.
 for _name, _case in list(globals().items()):
-    if _name[:1] in "vaj" and _name[1:3].isdigit() and callable(_case):
+    if _name[:1] in "vacjw" and _name[1:3].isdigit() and callable(_case):
         globals()[f"test_{_name}"] = _case
