@@ -210,6 +210,15 @@ def a02_enqueue_then_result(fake):
         SurfraClient().enqueue("fails", {}).result(timeout=30)
 
 
+def a06_submit_a_graph_and_wait(fake):
+    client = SurfraClient()
+    view = client.submit([
+        {"name": "a", "app_name": "embed", "depends_on": [], "input": {"n": 1}},
+        {"name": "b", "app_name": "rerank", "depends_on": ["a"], "input": {}},
+    ])
+    assert surfra.Call(client, view).result(timeout=30) == {"a": {"app": "embed", "echo": {"n": 1}}, "b": {"app": "rerank", "echo": {}}}
+
+
 def j01_job_with_volumes_finishes(fake):
     job = SurfraClient().submit_job("python train.py", image="img", providers=[{"provider": "local"}], volumes=["weights:r"])
     assert fake.state()["jobs"][job.id]["volumes"] == ["weights:r"]
