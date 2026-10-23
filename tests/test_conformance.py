@@ -217,6 +217,55 @@ def j01_job_with_volumes_finishes(fake):
     assert view["status"] == "succeeded" and view["exit_code"] == 0
 
 
+def v15_write_and_read_helpers(fake):
+    weights = fake.volume("weights")
+    weights.write("bytes.bin", b"\x00\x01raw")
+    assert weights.read("bytes.bin") == b"\x00\x01raw"
+
+
+def c01_control_plane_calls_skip_the_volumes_token(fake, tmp_path, monkeypatch):
+    token = tmp_path / "token"
+    token.write_text("aaa.bbb.ccc")
+    monkeypatch.setenv("SURFRA_VOLUMES_TOKEN_FILE", str(token))
+    weights = surfra.Volume("weights")
+    weights.create()
+    weights.ls()
+    SurfraClient().run("embed", {}, timeout=30)
+    sent = {item["path"]: item["auth"] for item in fake.state()["log"] if not item["path"].startswith("/_test/")}
+    assert sent["/v1/volumes"] == "Bearer sfk_test"
+    assert sent["/v1/transactions"] == "Bearer sfk_test"
+    assert sent["/v1/weights/list"] == "Bearer aaa.bbb.ccc"
+
+
+def a03_app_deploy_sends_the_spec(fake):
+    saved = surfra.App("embed").deploy(image="ghcr.io/acme/embed:1", entrypoint="app.py", autoscale={"max_replicas": 2}, runtime={"engine": "python"})
+    assert saved["name"] == "embed" and saved["id"].startswith("sfa_")
+    assert saved["image"] == "ghcr.io/acme/embed:1" and saved["autoscale"] == {"max_replicas": 2}
+    assert any(item["method"] == "PUT" and item["path"] == "/v1/apps/embed" for item in fake.state()["log"])
+
+
+def a04_app_run_and_volumes(fake):
+    app = surfra.App("embed")
+    assert app.run({"x": 1}, timeout=30) == {"app": "embed", "echo": {"x": 1}}
+    app.set_volumes(["weights:r"])
+    assert app.volumes() == [{"volume": "weights", "mode": "r"}]
+
+
+def a05_a_rate_limited_submit_waits_and_succeeds(fake):
+    assert SurfraClient().run("busy", {"n": 1}, timeout=30) == {"app": "busy", "echo": {"n": 1}}
+    assert [item["path"] for item in fake.state()["log"]].count("/v1/transactions") == 2
+
+
+def w01_workflow_run_returns_each_stage(fake):
+    out = surfra.Workflow("pipeline").run({"q": "hi"}, timeout=30)
+    assert out == {"a": {"app": "embed", "echo": {"q": "hi"}}, "b": {"app": "rerank", "echo": {}}}
+
+
+def j02_job_logs_oldest_first(fake):
+    job = SurfraClient().submit_job("echo hi", image="img", providers=[{"provider": "local"}])
+    assert [line["m"] for line in job.logs()] == ["line 0", "line 1", "line 2"]
+
+
 # pytest collects test_* functions; the case names above are the shared ids.
 for _name, _case in list(globals().items()):
     if _name[:1] in "vaj" and _name[1:3].isdigit() and callable(_case):

@@ -57,6 +57,16 @@ class App:
 
         return self.client().app(self.name)
 
+    def volumes(self) -> list[dict[str, str]]:
+        """The volumes this app's replicas may reach, as [{"volume", "mode"}]."""
+
+        return self.client().app_volumes(self.name)
+
+    def set_volumes(self, volumes: list[str]) -> list[dict[str, str]]:
+        """Replace the app's volumes, such as ["weights:r", "outputs:rw"]. Running replicas see it within 15 minutes."""
+
+        return self.client().set_app_volumes(self.name, volumes)
+
     def enqueue(self, payload: dict[str, Any] | None = None) -> Call:
         """Queue one request and return a Call right away."""
 

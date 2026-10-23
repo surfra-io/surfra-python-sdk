@@ -163,7 +163,7 @@ def _retry_after(response: httpx.Response) -> float:
 class SurfraClient:
     """HTTP client for the Surfra API.
 
-    api_key defaults to SURFRA_API_KEY. base_url defaults to SURFRA_MASTER, then https://api.surfra.io.
+    api_key defaults to SURFRA_API_KEY, then the session `surfra login` saved. base_url defaults to SURFRA_MASTER, then https://api.surfra.io.
     """
 
     def __init__(
@@ -173,7 +173,13 @@ class SurfraClient:
         *,
         transport: httpx.BaseTransport | None = None,
     ):
-        self.api_key = api_key or os.environ["SURFRA_API_KEY"]
+        from surfra.volumes import _saved_login
+
+        # Never the volumes token from SURFRA_VOLUMES_TOKEN_FILE: only the volumes service accepts it.
+        found = api_key or os.environ.get("SURFRA_API_KEY") or _saved_login()
+        if not found:
+            raise KeyError("SURFRA_API_KEY")
+        self.api_key = found
         self.base_url = (base_url or os.environ.get("SURFRA_MASTER") or "https://api.surfra.io").rstrip("/")
         self._http = httpx.Client(
             timeout=60,

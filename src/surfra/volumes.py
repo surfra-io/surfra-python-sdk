@@ -72,6 +72,24 @@ def _credential(explicit: str | None) -> str:
     raise SurfraError(401, "no credential: set SURFRA_API_KEY or run `surfra login`")
 
 
+def _saved_login() -> str | None:
+    try:
+        from surfra.host import CONFIG, _read
+
+        return _read(CONFIG).get("token") or None
+    except Exception:
+        return None
+
+
+def _control_credential(explicit: str | None) -> str:
+    """Control-plane calls never send the volumes token, which only the volumes service accepts."""
+
+    found = explicit or os.environ.get("SURFRA_API_KEY") or _saved_login()
+    if not found:
+        raise SurfraError(401, "no credential: set SURFRA_API_KEY or run `surfra login`")
+    return found
+
+
 def _master() -> str:
     try:
         from surfra.host import _master as saved_master
@@ -151,12 +169,14 @@ class Volume:
 
     # Grants for jobs and apps --------------------------------------------------------------
 
-    def mode(self, mode: str) -> str:
-        """A grant such as "weights:r", for job specs, app volumes and function decorators."""
+    def grant(self, mode: str) -> str:
+        """A grant such as "weights:r", for job specs and app volumes."""
 
         if mode not in MODES:
             raise ValueError("mode is r, w or rw")
         return f"{self.name}:{mode}"
+
+    mode = grant
 
     def path(self, path: str) -> VolumePath:
         return VolumePath(self, path)
@@ -186,7 +206,8 @@ class Volume:
         return response
 
     def _control(self, method: str, route: str, **kwargs: Any) -> Any:
-        response = self._http.request(method, f"{self._master}{route}", headers=self._headers(), **kwargs)
+        headers = {"Authorization": f"Bearer {_control_credential(self._api_key)}"}
+        response = self._http.request(method, f"{self._master}{route}", headers=headers, **kwargs)
         _raise(response)
         return response.json()
 
@@ -310,6 +331,28 @@ class Volume:
         except BaseException:
             Path(temp).unlink(missing_ok=True)
             raise
+
+    def read(self, path: str) -> bytes:
+        """One file's bytes."""
+
+        return self._request("GET", f"files/{_encode(path)}").content
+
+    def write(self, path: str, data: bytes | str, *, if_match: str | None = None) -> Entry:
+        """Upload bytes or text as one file. More than the part size goes up in parts."""
+
+        body = data.encode() if isinstance(data, str) else bytes(data)
+        if len(body) <= _part_bytes():
+            headers = {"Content-Length": str(len(body))}
+            if if_match:
+                headers["If-Match"] = if_match
+            stored = self._request("PUT", f"files/{_encode(path)}", create=True, content=body, headers=headers).json()
+            return Entry(stored["path"], int(stored["size"]), stored["etag"], "")
+        with tempfile.NamedTemporaryFile(prefix=".surfra-", delete=False) as handle:
+            handle.write(body)
+        try:
+            return self.put_file(handle.name, path)
+        finally:
+            Path(handle.name).unlink(missing_ok=True)
 
     def open(self, path: str, mode: str = "r", *, if_match: str | None = None) -> IO[Any]:
         """One file. "r"/"rb" reads it; "w"/"wb" writes to a temporary file and uploads it when closed."""
