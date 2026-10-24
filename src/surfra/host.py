@@ -64,6 +64,7 @@ def login() -> int:
     with httpx.Client(timeout=30) as http:
         started = http.post(f"{master}/v1/cli/device").json()
         print(f"Approve this machine at {started['verification_url']}")
+        print(f"Your code is {started['user_code']}. Or open the dashboard, choose Connect CLI, and type it there.")
         open_page(started["verification_url"])
         deadline = time.time() + 600
         while time.time() < deadline:
