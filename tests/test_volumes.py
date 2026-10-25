@@ -88,94 +88,96 @@ def fake(tmp_path, monkeypatch):
     return FakeVolumes()
 
 
-def volume(fake: FakeVolumes, name: str = "weights") -> Volume:
-    found = Volume(name, volumes_url="https://volumes.test", master="https://api.test")
-    found._http_client = httpx.Client(transport=httpx.MockTransport(fake))
+def volume(fake: FakeVolumes, sx, name: str = "weights"):
+    """A sync or async Volume (see conftest.py) on the fake. surfra.aio.Volume wraps a sync one."""
+
+    found = sx.surfra.Volume(name, volumes_url="https://volumes.test", master="https://api.test")
+    getattr(found, "_volume", found)._http_client = httpx.Client(transport=httpx.MockTransport(fake))
     return found
 
 
-def test_put_directory_and_list(fake, tmp_path):
+def test_put_directory_and_list(fake, tmp_path, sx):
     source = tmp_path / "minilm"
     (source / "1_Pooling").mkdir(parents=True)
     (source / "config.json").write_text("{}")
     (source / "1_Pooling" / "config.json").write_text("{}")
-    weights = volume(fake)
-    assert weights.put_directory(source, "minilm/") == 2
+    weights = volume(fake, sx)
+    assert sx(weights.put_directory(source, "minilm/")) == 2
     assert sorted(fake.files) == ["minilm/1_Pooling/config.json", "minilm/config.json"]
-    top = [entry.path for entry in weights.ls("minilm/")]
+    top = [entry.path for entry in sx(weights.ls("minilm/"))]
     assert top == ["minilm/config.json", "minilm/1_Pooling/"]
-    assert len(weights.ls("minilm/", recursive=True)) == 2
+    assert len(sx(weights.ls("minilm/", recursive=True))) == 2
 
 
-def test_local_downloads_once_then_only_what_changed(fake):
+def test_local_downloads_once_then_only_what_changed(fake, sx):
     fake.files = {"minilm/a.bin": b"a" * 10, "minilm/b.bin": b"b" * 10, "other/x": b"x"}
-    weights = volume(fake)
-    path = Path(weights.path("minilm/").local())
+    weights = volume(fake, sx)
+    path = Path(sx(weights.path("minilm/").local()))
     assert (path / "a.bin").read_bytes() == b"a" * 10
     assert not (path.parent / "other").exists()
     assert fake.downloads == 2
 
     # Same process: no listing, no downloads.
-    weights.path("minilm/").local()
+    sx(weights.path("minilm/").local())
     assert fake.downloads == 2
 
     # A new process with the same cache only fetches changed files, and drops deleted ones.
     fake.files["minilm/a.bin"] = b"A" * 12
     del fake.files["minilm/b.bin"]
-    again = volume(fake)
-    again.path("minilm/").local()
+    again = volume(fake, sx)
+    sx(again.path("minilm/").local())
     assert fake.downloads == 3
     assert (path / "a.bin").read_bytes() == b"A" * 12
     assert not (path / "b.bin").exists()
 
 
-def test_commit_uploads_changes_and_deletes_removed_files(fake):
+def test_commit_uploads_changes_and_deletes_removed_files(fake, sx):
     fake.files = {"ckpt/a": b"old", "ckpt/b": b"keep", "ckpt/c": b"gone"}
-    ckpts = volume(fake, "ckpts")
-    folder = Path(ckpts.path("ckpt/").local(mode="rw"))
+    ckpts = volume(fake, sx, "ckpts")
+    folder = Path(sx(ckpts.path("ckpt/").local(mode="rw")))
     (folder / "a").write_bytes(b"new")
     os.utime(folder / "a", (1, 1))
     (folder / "d").write_bytes(b"added")
     (folder / "c").unlink()
-    assert ckpts.commit() == {"uploaded": 2, "deleted": 1}
+    assert sx(ckpts.commit()) == {"uploaded": 2, "deleted": 1}
     assert fake.files == {"ckpt/a": b"new", "ckpt/b": b"keep", "ckpt/d": b"added"}
-    assert ckpts.commit() == {"uploaded": 0, "deleted": 0}
+    assert sx(ckpts.commit()) == {"uploaded": 0, "deleted": 0}
 
 
-def test_a_read_only_sync_never_uploads(fake):
+def test_a_read_only_sync_never_uploads(fake, sx):
     fake.files = {"m/a": b"1"}
-    weights = volume(fake)
-    folder = Path(weights.path("m/").local())
+    weights = volume(fake, sx)
+    folder = Path(sx(weights.path("m/").local()))
     (folder / "a").write_bytes(b"changed locally")
-    assert weights.commit() == {"uploaded": 0, "deleted": 0}
+    assert sx(weights.commit()) == {"uploaded": 0, "deleted": 0}
     assert fake.files == {"m/a": b"1"}
 
 
-def test_open_reads_and_writes_single_files(fake):
-    results = volume(fake, "results")
-    with results.open("runs/1.jsonl", "w") as handle:
+def test_open_reads_and_writes_single_files(fake, sx):
+    results = volume(fake, sx, "results")
+    with sx.ctx(results.open("runs/1.jsonl", "w")) as handle:
         handle.write('{"ok": true}\n')
     assert fake.files["runs/1.jsonl"] == b'{"ok": true}\n'
-    assert results.open("runs/1.jsonl").read() == '{"ok": true}\n'
+    assert sx(results.open("runs/1.jsonl")).read() == '{"ok": true}\n'
     with pytest.raises(RuntimeError):
-        with results.open("runs/2.jsonl", "w") as handle:
+        with sx.ctx(results.open("runs/2.jsonl", "w")) as handle:
             handle.write("partial")
             raise RuntimeError("boom")
     assert "runs/2.jsonl" not in fake.files
 
 
-def test_large_files_upload_in_parts(fake, tmp_path, monkeypatch):
+def test_large_files_upload_in_parts(fake, tmp_path, monkeypatch, sx):
     monkeypatch.setenv("SURFRA_VOLUMES_PART_BYTES", "4")
     fake.part_size = 4
     source = tmp_path / "big.bin"
     source.write_bytes(b"0123456789")
-    entry = volume(fake).put_file(source, "big.bin")
+    entry = sx(volume(fake, sx).put_file(source, "big.bin"))
     assert entry.size == 10 and fake.files["big.bin"] == b"0123456789"
 
 
-def test_errors_carry_the_services_reason(fake):
+def test_errors_carry_the_services_reason(fake, sx):
     with pytest.raises(SurfraError) as caught:
-        volume(fake).open("missing")
+        sx(volume(fake, sx).open("missing"))
     assert caught.value.status == 404 and "no such file" in caught.value.detail
 
 
@@ -189,10 +191,10 @@ def test_user_code_uses_the_workers_token_file(tmp_path, monkeypatch):
     assert volumes._credential(None) == "sfk_other"
 
 
-def test_grants_read_like_the_spec():
-    assert Volume("weights").mode("r") == "weights:r"
+def test_grants_read_like_the_spec(sx):
+    assert sx.surfra.Volume("weights").mode("r") == "weights:r"
     with pytest.raises(ValueError):
-        Volume("weights").mode("x")
+        sx.surfra.Volume("weights").mode("x")
 
 
 def test_the_local_proxy_adds_the_token_for_plain_requests(tmp_path):

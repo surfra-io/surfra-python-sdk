@@ -67,10 +67,13 @@ class App:
 
         return self.client().set_app_volumes(self.name, volumes)
 
-    def enqueue(self, payload: dict[str, Any] | None = None) -> Call:
-        """Queue one request and return a Call right away."""
+    def enqueue(self, payload: dict[str, Any] | None = None, *, callback_url: str | None = None) -> Call:
+        """Queue one request and return a Call right away.
 
-        return self.client().enqueue(self.name, payload)
+        callback_url is stored with the request. Surfra does not call it yet: delivery is planned.
+        """
+
+        return self.client().enqueue(self.name, payload, callback_url=callback_url)
 
     def run(self, payload: dict[str, Any] | None = None, *, timeout: float | None = None) -> Any:
         """Queue one request and wait for the handler's output."""

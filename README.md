@@ -25,6 +25,18 @@ client = SurfraClient()  # reads SURFRA_API_KEY
 print(client.run("my-app", {"prompt": "hi"}))
 ```
 
+From async code, use `surfra.aio`. It has the same names, and every call that talks to Surfra is
+awaited, so nothing blocks the event loop:
+
+```python
+import surfra.aio as surfra
+
+call = await surfra.App("my-app").enqueue({"prompt": "hi"})
+print(await call.result(timeout=300))
+```
+
+Sync code keeps `import surfra` and works as before.
+
 Guides and the API reference are at [docs.surfra.io](https://docs.surfra.io).
 
 ## License

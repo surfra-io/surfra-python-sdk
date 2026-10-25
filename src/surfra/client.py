@@ -70,18 +70,23 @@ class Call:
             time.sleep(interval)
 
     def result(self, *, timeout: float | None = None) -> Any:
-        view = self.poll(timeout=timeout)
-        stages = view.get("stages") or []
-        if view.get("status") != "succeeded":
-            details = []
-            for stage in stages:
-                output = stage.get("output") or {}
-                err = output.get("error") if isinstance(output, dict) else None
-                details.append(f"{stage.get('name')}: {err or stage.get('status')}")
-            raise RuntimeError("; ".join(details) or str(view.get("status")))
-        if len(stages) == 1:
-            return stages[0].get("output")
-        return {stage.get("name"): stage.get("output") for stage in stages}
+        return _result_of(self.poll(timeout=timeout))
+
+
+def _result_of(view: dict[str, Any]) -> Any:
+    """The output of a finished transaction, or RuntimeError with each stage's error."""
+
+    stages = view.get("stages") or []
+    if view.get("status") != "succeeded":
+        details = []
+        for stage in stages:
+            output = stage.get("output") or {}
+            err = output.get("error") if isinstance(output, dict) else None
+            details.append(f"{stage.get('name')}: {err or stage.get('status')}")
+        raise RuntimeError("; ".join(details) or str(view.get("status")))
+    if len(stages) == 1:
+        return stages[0].get("output")
+    return {stage.get("name"): stage.get("output") for stage in stages}
 
 
 class Job:
@@ -115,38 +120,115 @@ class Job:
     def logs(self, *, follow: bool = False, after: str | None = None, interval: float = 2.0) -> Iterator[dict[str, Any]]:
         """Lines oldest first, as {"t", "s", "m"}. "s" is out, err, or sys for Surfra's own lines."""
 
-        page = 1000
-        seen: dict[tuple[str, str, str], str] = {}
-        cursor = after
-        rewind = False
+        cursor = _LogCursor(after)
         while True:
-            params: dict[str, Any] = {"limit": page, "order": "asc"}
-            if cursor:
-                params["after"] = _rewound(cursor, LATE_LINES_SECONDS) if rewind else cursor
-            lines = _checked(self.client._http.get(f"{self.client.base_url}/v1/jobs/{self.id}/logs", params=params)).get("lines") or []
-            fresh = 0
-            for line in lines:
-                stamp = str(line.get("t") or "")
-                key = (stamp, str(line.get("s")), str(line.get("m")))
-                if key in seen:
-                    continue
-                seen[key] = stamp
-                fresh += 1
-                if stamp > (cursor or ""):
-                    cursor = stamp
-                yield line
-            if len(seen) > 20000 and cursor:
-                horizon = _rewound(cursor, LATE_LINES_SECONDS)
-                seen = {key: stamp for key, stamp in seen.items() if stamp >= horizon}
-            if len(lines) >= page and (fresh or rewind):
-                rewind = False
+            lines = _checked(self.client._http.get(f"{self.client.base_url}/v1/jobs/{self.id}/logs", params=cursor.params())).get("lines") or []
+            yield from cursor.feed(lines)
+            if cursor.more(lines):
                 continue
             if not follow:
                 return
-            rewind = True
+            cursor.rewind = True
             if self.get().get("status") in JOB_DONE:
                 follow = False
             time.sleep(interval)
+
+
+class _LogCursor:
+    """Paging state for job logs, shared by the sync and async clients.
+
+    A follow rereads LATE_LINES_SECONDS back, because lines are stored a little after they are printed,
+    and drops lines it has already returned.
+    """
+
+    PAGE = 1000
+
+    def __init__(self, after: str | None):
+        self.cursor = after
+        self.rewind = False
+        self.seen: dict[tuple[str, str, str], str] = {}
+        self.fresh = 0
+
+    def params(self) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": self.PAGE, "order": "asc"}
+        if self.cursor:
+            params["after"] = _rewound(self.cursor, LATE_LINES_SECONDS) if self.rewind else self.cursor
+        return params
+
+    def feed(self, lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out = []
+        self.fresh = 0
+        for line in lines:
+            stamp = str(line.get("t") or "")
+            key = (stamp, str(line.get("s")), str(line.get("m")))
+            if key in self.seen:
+                continue
+            self.seen[key] = stamp
+            self.fresh += 1
+            if stamp > (self.cursor or ""):
+                self.cursor = stamp
+            out.append(line)
+        if len(self.seen) > 20000 and self.cursor:
+            horizon = _rewound(self.cursor, LATE_LINES_SECONDS)
+            self.seen = {key: stamp for key, stamp in self.seen.items() if stamp >= horizon}
+        return out
+
+    def more(self, lines: list[dict[str, Any]]) -> bool:
+        """True when a full page came back with something new: read the next page now."""
+
+        if len(lines) >= self.PAGE and (self.fresh or self.rewind):
+            self.rewind = False
+            return True
+        return False
+
+
+def _submit_body(stages: list[dict[str, Any]], metadata: dict[str, Any] | None, callback_url: str | None) -> dict[str, Any]:
+    return {"stages": stages, "metadata": metadata or {}, "callback_url": callback_url}
+
+
+def _one_stage(app: str, payload: dict[str, Any] | None, name: str) -> dict[str, Any]:
+    return {"name": name, "app_name": app, "depends_on": [], "input": payload or {}}
+
+
+def _workflow_stages(saved: dict[str, Any], payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """A saved workflow as transaction stages. Stages with no dependencies receive payload."""
+
+    stages = []
+    for row in saved.get("stages") or []:
+        depends = list(row.get("depends") or [])
+        stages.append({"name": row["name"], "app_name": row["app"], "depends_on": depends, "input": {} if depends else payload or {}})
+    return stages
+
+
+def _job_body(fields: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in fields.items() if value is not None}
+
+
+def _deploy_body(image: str, entrypoint: str, env: dict[str, str] | None, registry: object, autoscale: Any, runtime: Any) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "image": image,
+        "entrypoint": entrypoint,
+        "env": env or {},
+        "registry": as_registry(registry),
+        "autoscale": autoscale or {},
+    }
+    if runtime is not None:
+        body["runtime"] = runtime
+    return body
+
+
+def _api_key(api_key: str | None) -> str:
+    from surfra.volumes import _saved_login
+
+    # Never the volumes token from SURFRA_VOLUMES_TOKEN_FILE: only the volumes service accepts it.
+    found = api_key or os.environ.get("SURFRA_API_KEY") or _saved_login()
+    if not found:
+        raise KeyError("SURFRA_API_KEY")
+    return found
+
+
+def _base_url(base_url: str | None) -> str:
+    return (base_url or os.environ.get("SURFRA_MASTER") or "https://api.surfra.io").rstrip("/")
 
 
 # Over the organization's request rate, submit waits as Surfra asks, this many times.
@@ -173,19 +255,24 @@ class SurfraClient:
         *,
         transport: httpx.BaseTransport | None = None,
     ):
-        from surfra.volumes import _saved_login
-
-        # Never the volumes token from SURFRA_VOLUMES_TOKEN_FILE: only the volumes service accepts it.
-        found = api_key or os.environ.get("SURFRA_API_KEY") or _saved_login()
-        if not found:
-            raise KeyError("SURFRA_API_KEY")
-        self.api_key = found
-        self.base_url = (base_url or os.environ.get("SURFRA_MASTER") or "https://api.surfra.io").rstrip("/")
+        self.api_key = _api_key(api_key)
+        self.base_url = _base_url(base_url)
         self._http = httpx.Client(
             timeout=60,
             headers={"Authorization": f"Bearer {self.api_key}"},
             transport=transport,
         )
+
+    def close(self) -> None:
+        """Close the HTTP connections. The client can't be used afterwards."""
+
+        self._http.close()
+
+    def __enter__(self) -> SurfraClient:
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
 
     def deploy_app(
         self,
@@ -204,15 +291,7 @@ class SurfraClient:
         Left out, the engine follows the entrypoint.
         """
 
-        body: dict[str, Any] = {
-            "image": image,
-            "entrypoint": entrypoint,
-            "env": env or {},
-            "registry": as_registry(registry),
-            "autoscale": autoscale or {},
-        }
-        if runtime is not None:
-            body["runtime"] = runtime
+        body = _deploy_body(image, entrypoint, env, registry, autoscale, runtime)
         return _checked(self._http.put(f"{self.base_url}/v1/apps/{quote(app_name, safe='')}", json=body))
 
     def apps(self) -> list[dict[str, Any]]:
@@ -234,16 +313,13 @@ class SurfraClient:
     def enqueue_workflow(self, name: str, payload: dict[str, Any] | None = None) -> Call:
         """Start a saved workflow. Stages with no dependencies receive payload."""
 
-        stages = []
-        for row in self.workflow(name).get("stages") or []:
-            depends = list(row.get("depends") or [])
-            stages.append({"name": row["name"], "app_name": row["app"], "depends_on": depends, "input": {} if depends else payload or {}})
+        stages = _workflow_stages(self.workflow(name), payload)
         return Call(self, self.submit(stages, metadata={"workflow": name}))
 
     def submit(self, stages: list[dict[str, Any]], *, metadata: dict[str, Any] | None = None, callback_url: str | None = None) -> dict[str, Any]:
         """Start a transaction. Each stage names an app and lists the stages it depends on."""
 
-        body = {"stages": stages, "metadata": metadata or {}, "callback_url": callback_url}
+        body = _submit_body(stages, metadata, callback_url)
         for attempt in range(RATE_RETRIES + 1):
             response = self._http.post(f"{self.base_url}/v1/transactions", json=body)
             if response.status_code != 429 or attempt == RATE_RETRIES:
@@ -252,12 +328,15 @@ class SurfraClient:
         raise AssertionError("unreachable")
 
     def transaction(self, transaction_id: str) -> dict[str, Any]:
-        return _checked(self._http.get(f"{self.base_url}/v1/transactions/{transaction_id}"))
+        return _checked(self._http.get(f"{self.base_url}/v1/transactions/{quote(transaction_id, safe='')}"))
 
-    def enqueue(self, app: str, payload: dict[str, Any] | None = None, *, name: str = "call") -> Call:
-        """Queue one call to an app and return it before the worker finishes."""
+    def enqueue(self, app: str, payload: dict[str, Any] | None = None, *, name: str = "call", callback_url: str | None = None) -> Call:
+        """Queue one call to an app and return it before the worker finishes.
 
-        view = self.submit([{"name": name, "app_name": app, "depends_on": [], "input": payload or {}}])
+        callback_url is stored with the request. Surfra does not call it yet: delivery is planned.
+        """
+
+        view = self.submit([_one_stage(app, payload, name)], callback_url=callback_url)
         return Call(self, view)
 
     def run(self, app: str, payload: dict[str, Any] | None = None, *, timeout: float | None = None) -> Any:
@@ -315,9 +394,7 @@ class SurfraClient:
         submission_id makes the call safe to retry: the same id returns the same job.
         """
 
-        body: dict[str, Any] = {
-            key: value
-            for key, value in {
+        body = _job_body({
                 "entrypoint": entrypoint,
                 "args": args,
                 "image": image,
@@ -334,9 +411,7 @@ class SurfraClient:
                 "volumes": volumes,
                 "name": name,
                 "submission_id": submission_id,
-            }.items()
-            if value is not None
-        }
+            })
         return Job(self, _checked(self._http.post(f"{self.base_url}/v1/jobs", json=body)))
 
     def app_volumes(self, app_name: str) -> list[dict[str, str]]:
@@ -350,7 +425,7 @@ class SurfraClient:
         return _checked(self._http.put(f"{self.base_url}/v1/apps/{quote(app_name, safe='')}/volumes", json={"volumes": volumes}))["volumes"]
 
     def job(self, job_id: str) -> Job:
-        return Job(self, _checked(self._http.get(f"{self.base_url}/v1/jobs/{job_id}")))
+        return Job(self, _checked(self._http.get(f"{self.base_url}/v1/jobs/{quote(job_id, safe='')}")))
 
     def jobs(self, *, limit: int = 50, status: str = "") -> list[dict[str, Any]]:
         return _checked(self._http.get(f"{self.base_url}/v1/jobs", params={"limit": limit, "status": status}))["jobs"]
