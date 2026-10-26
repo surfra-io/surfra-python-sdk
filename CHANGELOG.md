@@ -1,6 +1,12 @@
 # Changelog
 
-## [0.4.0] - unreleased
+## [0.4.1] - 2026-10-26
+
+### Added
+- `surfra.verify_webhook` (also in `surfra.aio`) checks a callback's `X-Surfra-Signature`, and
+  `surfra.InvalidSignature` is what it raises.
+
+## [0.4.0] - 2026-10-25
 
 ### Added
 - `surfra.aio`: the SDK for asyncio, with the same names as `surfra` (`App`, `Workflow`, `Call`, `Job`,
@@ -9,8 +15,6 @@
   Switch with `import surfra.aio as surfra` and add `await`.
 - `callback_url` on `SurfraClient.enqueue` and `App.enqueue`: Surfra POSTs the task's latest state there
   each time it changes.
-- `surfra.verify_webhook` (also in `surfra.aio`) checks a callback's `X-Surfra-Signature`, and
-  `surfra.InvalidSignature` is what it raises.
 - `SurfraClient.close()` and `with SurfraClient() as client:`.
 
 ### Changed
