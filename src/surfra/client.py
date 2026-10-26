@@ -333,7 +333,7 @@ class SurfraClient:
     def enqueue(self, app: str, payload: dict[str, Any] | None = None, *, name: str = "call", callback_url: str | None = None) -> Call:
         """Queue one call to an app and return it before the worker finishes.
 
-        callback_url is stored with the request. Surfra does not call it yet: delivery is planned.
+        Surfra POSTs the task's latest state to callback_url each time it changes. See verify_webhook.
         """
 
         view = self.submit([_one_stage(app, payload, name)], callback_url=callback_url)

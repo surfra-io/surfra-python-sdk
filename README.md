@@ -37,6 +37,15 @@ print(await call.result(timeout=300))
 
 Sync code keeps `import surfra` and works as before.
 
+Give a task a `callback_url` and Surfra POSTs its latest state there each time it changes. Check the
+signature in your handler:
+
+```python
+from surfra import verify_webhook
+
+event = verify_webhook(raw_body, request_headers, secret)  # raises surfra.InvalidSignature
+```
+
 Guides and the API reference are at [docs.surfra.io](https://docs.surfra.io).
 
 ## License

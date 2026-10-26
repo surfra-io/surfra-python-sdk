@@ -42,6 +42,7 @@ from surfra.credentials import Credentials
 from surfra.sdk import Request, batch_size, handler, progress, registered_stages, stage, warmup
 from surfra.types import Autoscale, ProviderRow, Runtime
 from surfra.volumes import Entry
+from surfra.webhooks import InvalidSignature, verify_webhook
 
 __all__ = [
     "App",
@@ -50,6 +51,7 @@ __all__ = [
     "Call",
     "Credentials",
     "Entry",
+    "InvalidSignature",
     "Job",
     "ProviderRow",
     "Request",
@@ -63,6 +65,7 @@ __all__ = [
     "handler",
     "progress",
     "stage",
+    "verify_webhook",
     "warmup",
 ]
 
@@ -227,7 +230,7 @@ class SurfraClient:
     async def enqueue(self, app: str, payload: dict[str, Any] | None = None, *, name: str = "call", callback_url: str | None = None) -> Call:
         """Queue one call to an app and return it before the worker finishes.
 
-        callback_url is stored with the request. Surfra does not call it yet: delivery is planned.
+        Surfra POSTs the task's latest state to callback_url each time it changes. See verify_webhook.
         """
 
         return Call(self, await self.submit([_one_stage(app, payload, name)], callback_url=callback_url))

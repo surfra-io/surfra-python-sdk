@@ -281,7 +281,19 @@ def j02_job_logs_oldest_first(fake, sx):
     assert [line["m"] for line in sx.list(job.logs())] == ["line 0", "line 1", "line 2"]
 
 
+def h01_callback_signatures_verify(sx):
+    """Pure, so the same function in both modes. Every vector in webhooks.json."""
+
+    doc = json.loads((SUITE / "webhooks.json").read_text())
+    for case in doc["cases"]:
+        if case["ok"]:
+            assert sx.surfra.verify_webhook(case["body"].encode(), {"x-surfra-signature": case["signature"]}, case["secret"], now=case["now"])["seq"] == 7, case["name"]
+        else:
+            with pytest.raises(sx.surfra.InvalidSignature):
+                sx.surfra.verify_webhook(case["body"].encode(), case["signature"], [case["secret"]], now=case["now"])
+
+
 # pytest collects test_* functions; the case names above are the shared ids.
 for _name, _case in list(globals().items()):
-    if _name[:1] in "vacjw" and _name[1:3].isdigit() and callable(_case):
+    if _name[:1] in "vacjwh" and _name[1:3].isdigit() and callable(_case):
         globals()[f"test_{_name}"] = _case

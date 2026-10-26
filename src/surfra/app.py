@@ -70,7 +70,7 @@ class App:
     def enqueue(self, payload: dict[str, Any] | None = None, *, callback_url: str | None = None) -> Call:
         """Queue one request and return a Call right away.
 
-        callback_url is stored with the request. Surfra does not call it yet: delivery is planned.
+        Surfra POSTs the task's latest state to callback_url each time it changes. See verify_webhook.
         """
 
         return self.client().enqueue(self.name, payload, callback_url=callback_url)
