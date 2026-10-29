@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from surfra import update
 from surfra.box import SEAL_VERSION, box_context, open_box
 from surfra.cli import open_page
+from surfra.version import HEADERS
 
 HOME = Path.home() / ".surfra"
 CONFIG = HOME / "config.json"
@@ -61,7 +62,7 @@ def _session() -> str:
 
 def login() -> int:
     master = _master()
-    with httpx.Client(timeout=30) as http:
+    with httpx.Client(timeout=30, headers=HEADERS) as http:
         started = http.post(f"{master}/v1/cli/device").json()
         print(f"Approve this machine at {started['verification_url']}")
         print(f"Your code is {started['user_code']}. Or open the dashboard, choose Connect CLI, and type it there.")
@@ -179,7 +180,7 @@ def register(name: str = "") -> int:
     server, finished = (None, None) if name else _listen_for_callback()
     callback = f"http://127.0.0.1:{server.server_address[1]}/callback" if server else ""
     try:
-        with httpx.Client(timeout=30, headers={"Authorization": f"Bearer {token}"}) as http:
+        with httpx.Client(timeout=30, headers={"Authorization": f"Bearer {token}", **HEADERS}) as http:
             started = http.post(
                 f"{master}/v1/runners/pending",
                 json={
@@ -227,7 +228,7 @@ def whoami() -> int:
         print("this machine is not registered. Run surfra runner register.", file=sys.stderr)
         return 1
     master = saved.get("master") or _master()
-    response = httpx.get(f"{master}/v1/runners/me", headers={"Authorization": f"Bearer {token}"}, timeout=30)
+    response = httpx.get(f"{master}/v1/runners/me", headers={"Authorization": f"Bearer {token}", **HEADERS}, timeout=30)
     if response.status_code == 401:
         print("this runner token is no longer valid. Run surfra runner register.", file=sys.stderr)
         return 1
@@ -266,7 +267,7 @@ def start() -> int:
         print(problem, file=sys.stderr)
         return 1
     master = (saved.get("master") or _master()).rstrip("/")
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": f"Bearer {token}", **HEADERS}
     PID.write_text(str(os.getpid()))
     signal.signal(signal.SIGTERM, _exit_on_term)
     print(f"runner {saved.get('id')} waiting for an app")
@@ -528,7 +529,7 @@ def stop(force: bool = False) -> int:
 
 def _go_offline(master: str, token: str) -> bool:
     try:
-        response = httpx.post(f"{master}/v1/runners/offline", headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        response = httpx.post(f"{master}/v1/runners/offline", headers={"Authorization": f"Bearer {token}", **HEADERS}, timeout=30)
         response.raise_for_status()
     except httpx.HTTPError:
         return False

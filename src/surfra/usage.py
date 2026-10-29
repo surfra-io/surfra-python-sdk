@@ -21,6 +21,7 @@ import time
 from typing import Any
 
 import httpx
+from surfra.version import HEADERS
 
 SAMPLE = 10.0
 REPORT = 60.0
@@ -414,7 +415,7 @@ class Reporter:
                 continue
             report, samples, sent = aggregate(samples), [], time.monotonic()
             try:
-                httpx.post(f"{self.master}/v1/workers/usage", json={"replica_token": self.token, "sample": report}, timeout=10)
+                httpx.post(f"{self.master}/v1/workers/usage", json={"replica_token": self.token, "sample": report}, headers=HEADERS, timeout=10)
             except httpx.HTTPError:
                 pass
 

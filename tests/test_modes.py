@@ -46,7 +46,7 @@ def test_each_class_has_the_same_methods_and_parameters(name):
 
 @pytest.mark.parametrize("name", CLASSES)
 def test_network_methods_are_async_only_in_aio(name):
-    local = {"grant", "mode", "path"}  # build names or handles; no request
+    local = {"grant", "mode", "path", "with_retry"}  # build names, handles or copies; no request
     for method, fn in _public(getattr(surfra.aio, name)).items():
         fn = getattr(fn, "__func__", fn)
         if method in local or method == "client":

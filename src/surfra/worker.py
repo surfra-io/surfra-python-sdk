@@ -24,6 +24,7 @@ import httpx
 from surfra import logship, usage
 from surfra.runner import load_app, run_handler_batch, run_warmup
 from surfra.sdk import adopt_handler_spec, bind_progress_hook, registered_handler_spec, take_batch, unbind_progress_hook
+from surfra.version import HEADERS
 
 _BAKED = ("SURFRA_MASTER", "SURFRA_REPLICA_TOKEN", "SURFRA_ENTRYPOINT")
 # An idle poll waits on Surfra this long for work, so a worker does not ask every few seconds.
@@ -123,9 +124,9 @@ class WorkerClient:
         self.waiting = False
         self.backoff = 1.0
         self._pause: float | None = None
-        self._http = httpx.Client(timeout=60)
+        self._http = httpx.Client(timeout=60, headers=HEADERS)
         # httpx clients are not shared across threads, so heartbeats get their own.
-        self._beat_http = httpx.Client(timeout=10)
+        self._beat_http = httpx.Client(timeout=10, headers=HEADERS)
 
     def pause(self, interval: float) -> float:
         """Seconds to sleep after a step that ran nothing."""

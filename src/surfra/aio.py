@@ -24,7 +24,6 @@ from surfra import volumes as _volumes
 from surfra.client import (
     _DONE,
     JOB_DONE,
-    RATE_RETRIES,
     SurfraError,
     _api_key,
     _base_url,
@@ -34,7 +33,7 @@ from surfra.client import (
     _LogCursor,
     _one_stage,
     _result_of,
-    _retry_after,
+    _policy,
     _submit_body,
     _workflow_stages,
 )
@@ -43,6 +42,7 @@ from surfra.sdk import Request, batch_size, handler, progress, registered_stages
 from surfra.types import Autoscale, ProviderRow, Runtime
 from surfra.volumes import Entry
 from surfra.webhooks import InvalidSignature, verify_webhook
+from surfra.version import HEADERS
 
 __all__ = [
     "App",
@@ -158,17 +158,38 @@ class SurfraClient:
         base_url: str | None = None,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        max_retries: int | None = None,
+        retry_deadline: float | None = None,
+        on_retry: Any = None,
     ):
+        from surfra.retry import AsyncRetryTransport
+
         self.api_key = _api_key(api_key)
         self.base_url = _base_url(base_url)
-        self._http = httpx.AsyncClient(
-            timeout=60,
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            transport=transport,
-        )
+        self._transport = AsyncRetryTransport(transport, _policy(max_retries, retry_deadline, on_retry))
+        self._owner = True
+        self._http = self._client(self._transport)
+
+    def _client(self, transport: Any) -> httpx.AsyncClient:
+        return httpx.AsyncClient(timeout=60, headers={"Authorization": f"Bearer {self.api_key}", **HEADERS}, transport=transport)
+
+    @property
+    def retry_policy(self) -> Any:
+        return self._transport.policy
+
+    def with_retry(self, *, max_retries: int | None = None, retry_deadline: float | None = None, on_retry: Any = None) -> SurfraClient:
+        """A client sharing this one's connections, with other retry limits. The same as surfra.SurfraClient.with_retry."""
+
+        clone = object.__new__(type(self))
+        clone.__dict__.update(self.__dict__)
+        clone._transport = self._transport.with_policy(self._transport.policy.with_(max_retries=max_retries, deadline=retry_deadline, on_retry=on_retry))
+        clone._owner = False
+        clone._http = clone._client(clone._transport)
+        return clone
 
     async def aclose(self) -> None:
-        await self._http.aclose()
+        if self._owner:
+            await self._http.aclose()
 
     async def __aenter__(self) -> SurfraClient:
         return self
@@ -216,13 +237,7 @@ class SurfraClient:
     async def submit(self, stages: list[dict[str, Any]], *, metadata: dict[str, Any] | None = None, callback_url: str | None = None) -> dict[str, Any]:
         """Start a transaction. Each stage names an app and lists the stages it depends on."""
 
-        body = _submit_body(stages, metadata, callback_url)
-        for attempt in range(RATE_RETRIES + 1):
-            response = await self._http.post(f"{self.base_url}/v1/transactions", json=body)
-            if response.status_code != 429 or attempt == RATE_RETRIES:
-                return _checked(response)
-            await asyncio.sleep(_retry_after(response))
-        raise AssertionError("unreachable")
+        return _checked(await self._http.post(f"{self.base_url}/v1/transactions", json=_submit_body(stages, metadata, callback_url)))
 
     async def transaction(self, transaction_id: str) -> dict[str, Any]:
         return _checked(await self._http.get(f"{self.base_url}/v1/transactions/{quote(transaction_id, safe='')}"))
@@ -475,8 +490,17 @@ class Volume:
     Transfers run in a worker thread, so the event loop keeps running while files move.
     """
 
-    def __init__(self, name: str, *, api_key: str | None = None, volumes_url: str | None = None, master: str | None = None):
-        self._volume = _volumes.Volume(name, api_key=api_key, volumes_url=volumes_url, master=master)
+    def __init__(
+        self,
+        name: str,
+        *,
+        api_key: str | None = None,
+        volumes_url: str | None = None,
+        master: str | None = None,
+        max_retries: int | None = None,
+        retry_deadline: float | None = None,
+    ):
+        self._volume = _volumes.Volume(name, api_key=api_key, volumes_url=volumes_url, master=master, max_retries=max_retries, retry_deadline=retry_deadline)
         self.name = name
 
     def __repr__(self) -> str:

@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 
 from surfra import logship
+from surfra.version import HEADERS
 
 FINISH_RETRY_SECONDS = 3600
 
@@ -31,7 +32,7 @@ class Agent:
         self.master = master.rstrip("/")
         self.token = token
         self.volume_tokens = None
-        self.http = httpx.Client(timeout=30, headers={"X-Surfra-Replica-Token": token})
+        self.http = httpx.Client(timeout=30, headers={"X-Surfra-Replica-Token": token, **HEADERS})
         self.heartbeat = heartbeat
         self.grace = 30.0
         self.proc: subprocess.Popen[bytes] | None = None

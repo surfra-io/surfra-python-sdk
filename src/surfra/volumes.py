@@ -27,6 +27,7 @@ from urllib.parse import quote
 import httpx
 
 from surfra.client import SurfraError
+from surfra.version import HEADERS
 
 PART_BYTES = 64 * 1024 * 1024
 
@@ -102,12 +103,9 @@ def _master() -> str:
 def _raise(response: httpx.Response) -> None:
     if response.is_success:
         return
-    try:
-        body = response.json()
-        detail = body.get("error") or body.get("detail")
-    except ValueError:
-        detail = None
-    raise SurfraError(response.status_code, str(detail or response.text or response.reason_phrase))
+    from surfra.client import _error
+
+    raise _error(response)
 
 
 def _encode(path: str) -> str:
@@ -155,8 +153,20 @@ class Volume:
     SURFRA_REPLICA_TOKEN, then the session saved by `surfra login`.
     """
 
-    def __init__(self, name: str, *, api_key: str | None = None, volumes_url: str | None = None, master: str | None = None):
+    def __init__(
+        self,
+        name: str,
+        *,
+        api_key: str | None = None,
+        volumes_url: str | None = None,
+        master: str | None = None,
+        max_retries: int | None = None,
+        retry_deadline: float | None = None,
+    ):
+        from surfra.client import _policy
+
         self.name = name
+        self._retry = _policy(max_retries, retry_deadline, None)
         self._api_key = api_key
         self._url = (volumes_url or _volumes_url()).rstrip("/")
         self._master = (master or _master()).rstrip("/")
@@ -186,7 +196,9 @@ class Volume:
     @property
     def _http(self) -> httpx.Client:
         if self._http_client is None:
-            self._http_client = httpx.Client(timeout=httpx.Timeout(60.0, read=300.0), follow_redirects=False)
+            from surfra.retry import RetryTransport
+
+            self._http_client = httpx.Client(timeout=httpx.Timeout(60.0, read=300.0), follow_redirects=False, headers=HEADERS, transport=RetryTransport(policy=self._retry))
         return self._http_client
 
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -532,7 +544,7 @@ class _Upload(io.RawIOBase):
 def refresh_token_file(master: str, replica_token: str, path: Path) -> bool:
     """Exchange the replica token for a volumes-only token and write it where user code can read it."""
 
-    response = httpx.post(f"{master.rstrip('/')}/v1/tokens", headers={"Authorization": f"Bearer {replica_token}"}, json={"audience": "volumes"}, timeout=30)
+    response = httpx.post(f"{master.rstrip('/')}/v1/tokens", headers={"Authorization": f"Bearer {replica_token}", **HEADERS}, json={"audience": "volumes"}, timeout=30)
     if not response.is_success:
         return False
     path.parent.mkdir(parents=True, exist_ok=True)

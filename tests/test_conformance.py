@@ -57,6 +57,12 @@ def fake(server, tmp_path, monkeypatch, sx):
         def state(self):
             return httpx.get(f"{server}/_test/state").json()
 
+        def faults(self, *items):
+            httpx.post(f"{server}/_test/faults", json={"faults": list(items)})
+
+        def count(self, method, path):
+            return sum(1 for item in self.state()["log"] if item["method"] == method and item["path"].startswith(path))
+
         def volume(self, name):
             httpx.post(f"{server}/v1/volumes", json={"name": name}, headers={"Authorization": "Bearer sfk_test"})
             return sx.surfra.Volume(name)
@@ -293,7 +299,131 @@ def h01_callback_signatures_verify(sx):
                 sx.surfra.verify_webhook(case["body"].encode(), case["signature"], [case["secret"]], now=case["now"])
 
 
+def _refusal(status, kind, retry_after=None):
+    fault = {"status": status, "body": {"detail": kind.lower(), "error": {"type": kind, "message": kind.lower()}}}
+    if retry_after is not None:
+        fault["body"]["error"]["retry_after"] = retry_after
+        fault["headers"] = {"Retry-After": str(retry_after)}
+    return fault
+
+
+SUBMIT = {"method": "POST", "path": "/v1/transactions"}
+POLL = {"method": "GET", "path": "/v1/transactions/"}
+
+
+def r01_rate_limited_waits_retry_after_then_succeeds(fake, sx):
+    fake.faults({**SUBMIT, **_refusal(429, "RATE_LIMITED", 1)})
+    started = time.monotonic()
+    assert sx(sx.surfra.SurfraClient().run("embed", {"n": 1}, timeout=30)) == {"app": "embed", "echo": {"n": 1}}
+    assert time.monotonic() - started >= 0.9 and fake.count("POST", "/v1/transactions") == 2
+
+
+def r02_queue_full_is_retried(fake, sx):
+    fake.faults({**SUBMIT, **_refusal(503, "QUEUE_FULL", 0)})
+    assert sx(sx.surfra.SurfraClient().run("embed", {}, timeout=30)) == {"app": "embed", "echo": {}}
+    assert fake.count("POST", "/v1/transactions") == 2
+
+
+def r03_server_busy_on_a_get_is_retried(fake, sx):
+    client = sx.surfra.SurfraClient()
+    call = sx(client.enqueue("embed", {"n": 3}))
+    fake.faults({**POLL, **_refusal(503, "SERVER_BUSY", 0)})
+    assert sx(call.result(timeout=30)) == {"app": "embed", "echo": {"n": 3}}
+
+
+def r04_app_paused_is_not_retried(fake, sx):
+    fake.faults({**SUBMIT, **_refusal(503, "APP_PAUSED")})
+    with pytest.raises(SurfraError) as caught:
+        sx(sx.surfra.SurfraClient().enqueue("embed", {}))
+    assert (caught.value.status, caught.value.type, caught.value.attempts) == (503, "APP_PAUSED", 1)
+    assert fake.count("POST", "/v1/transactions") == 1
+
+
+def r05_defcon_active_is_not_retried(fake, sx):
+    fake.faults({**SUBMIT, **_refusal(503, "DEFCON_ACTIVE")})
+    with pytest.raises(SurfraError) as caught:
+        sx(sx.surfra.SurfraClient().enqueue("embed", {}))
+    assert caught.value.type == "DEFCON_ACTIVE" and fake.count("POST", "/v1/transactions") == 1
+
+
+def r13_http_calls_limit_is_not_retried(fake, sx):
+    fake.faults({**SUBMIT, **_refusal(402, "HTTP_CALLS_LIMIT")})
+    with pytest.raises(SurfraError) as caught:
+        sx(sx.surfra.SurfraClient().enqueue("embed", {}))
+    assert (caught.value.status, caught.value.type, caught.value.attempts) == (402, "HTTP_CALLS_LIMIT", 1)
+    assert str(caught.value)
+    assert fake.count("POST", "/v1/transactions") == 1
+
+
+def r06_a_plain_502_is_retried_on_get_only(fake, sx):
+    client = sx.surfra.SurfraClient()
+    call = sx(client.enqueue("embed", {}))
+    fake.faults({**POLL, "status": 502, "raw": "<html>bad gateway</html>"})
+    assert sx(call.result(timeout=30)) == {"app": "embed", "echo": {}}
+    fake.faults({**SUBMIT, "status": 502, "raw": "<html>bad gateway</html>"})
+    with pytest.raises(SurfraError) as caught:
+        sx(client.enqueue("embed", {}))
+    assert caught.value.status == 502 and caught.value.type is None and not caught.value.outcome_unknown
+    assert fake.count("POST", "/v1/transactions") == 2  # one from the first enqueue, one refused
+
+
+def r07_a_plain_504_on_a_submit_is_an_unknown_outcome(fake, sx):
+    fake.faults({**SUBMIT, "status": 504, "raw": "upstream timed out"})
+    with pytest.raises(SurfraError) as caught:
+        sx(sx.surfra.SurfraClient().enqueue("embed", {}))
+    assert caught.value.status == 504 and caught.value.outcome_unknown and "may be running" in str(caught.value)
+    assert fake.count("POST", "/v1/transactions") == 1
+
+
+def r08_a_dropped_connection_is_retried_on_get_only(fake, sx):
+    client = sx.surfra.SurfraClient()
+    call = sx(client.enqueue("embed", {}))
+    fake.faults({**POLL, "drop": True})
+    assert sx(call.result(timeout=30)) == {"app": "embed", "echo": {}}
+    fake.faults({**SUBMIT, "drop": True})
+    with pytest.raises(SurfraError) as caught:
+        sx(client.enqueue("embed", {}))
+    assert caught.value.outcome_unknown and caught.value.status == 0 and "may be running" in str(caught.value)
+    assert fake.count("POST", "/v1/transactions") == 2
+
+
+def r09_a_400_is_not_retried(fake, sx):
+    fake.faults({**SUBMIT, "status": 400, "body": {"detail": "stages must be a list"}})
+    with pytest.raises(SurfraError) as caught:
+        sx(sx.surfra.SurfraClient().enqueue("embed", {}))
+    assert caught.value.status == 400 and caught.value.attempts == 1 and fake.count("POST", "/v1/transactions") == 1
+
+
+def r10_a_refused_connection_is_retried(fake, sx):
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    events = []
+    client = sx.surfra.SurfraClient(base_url=f"http://127.0.0.1:{port}", max_retries=2, on_retry=events.append)
+    with pytest.raises(SurfraError) as caught:
+        sx(client.enqueue("embed", {}))
+    assert caught.value.attempts == 3 and caught.value.status == 0 and not caught.value.outcome_unknown
+    assert [event.attempt for event in events] == [1, 2] and all(event.status is None for event in events)
+
+
+def r11_retries_stop_after_max_retries(fake, sx):
+    fake.faults({**SUBMIT, **_refusal(503, "SERVER_BUSY", 0), "times": 10})
+    with pytest.raises(SurfraError) as caught:
+        sx(sx.surfra.SurfraClient(max_retries=2).enqueue("embed", {}))
+    assert (caught.value.type, caught.value.attempts) == ("SERVER_BUSY", 3)
+    assert fake.count("POST", "/v1/transactions") == 3
+
+
+def r12_a_wait_past_the_deadline_is_not_taken(fake, sx):
+    fake.faults({**SUBMIT, **_refusal(429, "RATE_LIMITED", 30)})
+    started = time.monotonic()
+    with pytest.raises(SurfraError) as caught:
+        sx(sx.surfra.SurfraClient().with_retry(retry_deadline=2).enqueue("embed", {}))
+    assert time.monotonic() - started < 1.5
+    assert (caught.value.type, caught.value.retry_after, caught.value.attempts) == ("RATE_LIMITED", 30, 1)
+
+
 # pytest collects test_* functions; the case names above are the shared ids.
 for _name, _case in list(globals().items()):
-    if _name[:1] in "vacjwh" and _name[1:3].isdigit() and callable(_case):
+    if _name[:1] in "vacjwhr" and _name[1:3].isdigit() and callable(_case):
         globals()[f"test_{_name}"] = _case

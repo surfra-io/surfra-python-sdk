@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 import httpx
+from surfra.version import HEADERS
 
 BATCH_BYTES = 8 << 20
 LINE_BYTES = 16 << 10
@@ -174,7 +175,7 @@ class LogShipper:
                         response = httpx.post(
                             f"{self.master}/v1/workers/logs",
                             content=gzip.compress(raw),
-                            headers={"Content-Type": "application/x-ndjson", "Content-Encoding": "gzip", "X-Surfra-Replica-Token": self.token},
+                            headers={"Content-Type": "application/x-ndjson", "Content-Encoding": "gzip", "X-Surfra-Replica-Token": self.token, **HEADERS},
                             timeout=timeout,
                         )
                     except httpx.HTTPError:

@@ -136,9 +136,9 @@ def test_a_rate_limited_submit_waits_as_asked(sx, monkeypatch):
         async def fake_sleep(seconds):
             waits.append(seconds)
 
-        monkeypatch.setattr("surfra.aio.asyncio.sleep", fake_sleep)
+        monkeypatch.setattr("surfra.retry.asyncio.sleep", fake_sleep)
     else:
-        monkeypatch.setattr("surfra.client.time.sleep", waits.append)
+        monkeypatch.setattr("surfra.retry.time.sleep", waits.append)
     replies = iter([
         httpx.Response(429, headers={"retry-after": "3"}, json={"detail": "slow down"}),
         httpx.Response(200, json={"id": "tx_7", "status": "running", "stages": []}),

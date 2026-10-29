@@ -13,6 +13,7 @@ import httpx
 
 from surfra.credentials import as_registry
 from surfra.types import Autoscale, Runtime
+from surfra.version import HEADERS
 
 _DONE = {"succeeded", "failed"}
 JOB_DONE = {"succeeded", "failed", "stopped", "lost"}
@@ -29,22 +30,73 @@ def _rewound(stamp: str, seconds: float) -> str:
 
 
 class SurfraError(RuntimeError):
-    """The API refused a request. status is the HTTP code. detail is the server's reason."""
+    """The API refused a request, or couldn't be reached.
 
-    def __init__(self, status: int, detail: str):
-        super().__init__(f"{status}: {detail}")
+    status: the HTTP code, or 0 when no answer came back.
+    detail: the server's reason.
+    type: Surfra's error type, such as RATE_LIMITED, QUEUE_FULL, SERVER_BUSY, APP_PAUSED, DEFCON_ACTIVE or HTTP_CALLS_LIMIT (402: the month's included HTTP calls are used up and there is no card on file); None when there is none.
+    attempts: how many times the request was sent, retries included.
+    outcome_unknown: a submission got a 504 or lost its connection after it was sent. It may be running:
+        check it before submitting again.
+    retry_after: seconds Surfra asked to wait, when it said.
+    """
+
+    def __init__(
+        self,
+        status: int,
+        detail: str,
+        *,
+        type: str | None = None,
+        attempts: int = 1,
+        outcome_unknown: bool = False,
+        retry_after: float | None = None,
+    ):
+        super().__init__(f"{status}: {detail}" if status else detail)
         self.status = status
         self.detail = detail
+        self.type = type
+        self.attempts = attempts
+        self.outcome_unknown = outcome_unknown
+        self.retry_after = retry_after
+
+
+UNKNOWN_OUTCOME = (
+    "It may be running: check it before submitting again. For long work, use enqueue() and result(), "
+    "or a callback_url, instead of one long call."
+)
+
+
+def _error(response: httpx.Response) -> SurfraError:
+    """The SurfraError for a refused response: status, Surfra's error type and message, and the retry history."""
+
+    from surfra.retry import error_type, retry_after
+
+    detail = None
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        error = body.get("error")
+        detail = body.get("detail") or (error.get("message") if isinstance(error, dict) else error)
+    unknown = bool(response.extensions.get("surfra_outcome_unknown"))
+    text = str(detail or response.text or response.reason_phrase)
+    if unknown:
+        text = f"{text.strip()} (no answer in time). {UNKNOWN_OUTCOME}"
+    return SurfraError(
+        response.status_code,
+        text,
+        type=error_type(response),
+        attempts=int(response.extensions.get("surfra_attempts") or 1),
+        outcome_unknown=unknown,
+        retry_after=retry_after(response),
+    )
 
 
 def _checked(response: httpx.Response) -> Any:
     if response.is_success:
         return response.json()
-    try:
-        detail = response.json().get("detail")
-    except ValueError:
-        detail = None
-    raise SurfraError(response.status_code, str(detail or response.text or response.reason_phrase))
+    raise _error(response)
 
 
 class Call:
@@ -231,21 +283,21 @@ def _base_url(base_url: str | None) -> str:
     return (base_url or os.environ.get("SURFRA_MASTER") or "https://api.surfra.io").rstrip("/")
 
 
-# Over the organization's request rate, submit waits as Surfra asks, this many times.
-RATE_RETRIES = 5
+def _policy(max_retries: int | None, retry_deadline: float | None, on_retry: Any) -> Any:
+    from surfra.retry import RetryPolicy
 
-
-def _retry_after(response: httpx.Response) -> float:
-    try:
-        return min(60.0, max(1.0, float(response.headers.get("retry-after") or 1)))
-    except ValueError:
-        return 1.0
+    return RetryPolicy().with_(max_retries=max_retries, deadline=retry_deadline, on_retry=on_retry)
 
 
 class SurfraClient:
     """HTTP client for the Surfra API.
 
     api_key defaults to SURFRA_API_KEY, then the session `surfra login` saved. base_url defaults to SURFRA_MASTER, then https://api.surfra.io.
+
+    Overload answers (429 RATE_LIMITED, 503 QUEUE_FULL, 503 SERVER_BUSY) are retried after Retry-After, at
+    most max_retries times (7) within retry_deadline seconds (180) of the first try; see surfra.retry.
+    max_retries=0 turns retries off. on_retry(event) is called before each wait. with_retry() makes a copy
+    with other limits for some calls.
     """
 
     def __init__(
@@ -254,19 +306,43 @@ class SurfraClient:
         base_url: str | None = None,
         *,
         transport: httpx.BaseTransport | None = None,
+        max_retries: int | None = None,
+        retry_deadline: float | None = None,
+        on_retry: Any = None,
     ):
+        from surfra.retry import RetryTransport
+
         self.api_key = _api_key(api_key)
         self.base_url = _base_url(base_url)
-        self._http = httpx.Client(
-            timeout=60,
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            transport=transport,
-        )
+        self._transport = RetryTransport(transport, _policy(max_retries, retry_deadline, on_retry))
+        self._owner = True
+        self._http = self._client(self._transport)
+
+    def _client(self, transport: Any) -> httpx.Client:
+        return httpx.Client(timeout=60, headers={"Authorization": f"Bearer {self.api_key}", **HEADERS}, transport=transport)
+
+    @property
+    def retry_policy(self) -> Any:
+        return self._transport.policy
+
+    def with_retry(self, *, max_retries: int | None = None, retry_deadline: float | None = None, on_retry: Any = None) -> SurfraClient:
+        """A client sharing this one's connections, with other retry limits.
+
+            client.with_retry(max_retries=0).submit(...)   # this call is never retried
+        """
+
+        clone = object.__new__(type(self))
+        clone.__dict__.update(self.__dict__)
+        clone._transport = self._transport.with_policy(self._transport.policy.with_(max_retries=max_retries, deadline=retry_deadline, on_retry=on_retry))
+        clone._owner = False
+        clone._http = clone._client(clone._transport)
+        return clone
 
     def close(self) -> None:
-        """Close the HTTP connections. The client can't be used afterwards."""
+        """Close the HTTP connections. The client, and copies from with_retry(), can't be used afterwards."""
 
-        self._http.close()
+        if self._owner:
+            self._http.close()
 
     def __enter__(self) -> SurfraClient:
         return self
@@ -319,13 +395,7 @@ class SurfraClient:
     def submit(self, stages: list[dict[str, Any]], *, metadata: dict[str, Any] | None = None, callback_url: str | None = None) -> dict[str, Any]:
         """Start a transaction. Each stage names an app and lists the stages it depends on."""
 
-        body = _submit_body(stages, metadata, callback_url)
-        for attempt in range(RATE_RETRIES + 1):
-            response = self._http.post(f"{self.base_url}/v1/transactions", json=body)
-            if response.status_code != 429 or attempt == RATE_RETRIES:
-                return _checked(response)
-            time.sleep(_retry_after(response))
-        raise AssertionError("unreachable")
+        return _checked(self._http.post(f"{self.base_url}/v1/transactions", json=_submit_body(stages, metadata, callback_url)))
 
     def transaction(self, transaction_id: str) -> dict[str, Any]:
         return _checked(self._http.get(f"{self.base_url}/v1/transactions/{quote(transaction_id, safe='')}"))
