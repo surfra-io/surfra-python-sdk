@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [0.5.0] - 2026-10-29
 
 ### Added
 - Every request sends `Surfra-Client: surfra-python/<version>`, so the control plane can trace errors to a release.
