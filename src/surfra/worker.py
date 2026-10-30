@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 
 from surfra import logship, usage
+from surfra.stream import ReplicaGone, ReplicaStream, WorkerUnknown
 from surfra.runner import load_app, run_handler_batch, run_warmup
 from surfra.sdk import adopt_handler_spec, bind_progress_hook, registered_handler_spec, take_batch, unbind_progress_hook
 from surfra.version import HEADERS
@@ -127,6 +128,8 @@ class WorkerClient:
         self.waiting = False
         self.backoff = 1.0
         self._pause: float | None = None
+        # The replica stream, shared by every worker in this container, when Surfra offers it.
+        self.stream: ReplicaStream | None = None
         self._http = httpx.Client(timeout=60, headers=HEADERS)
         # httpx clients are not shared across threads, so heartbeats get their own.
         self._beat_http = httpx.Client(timeout=10, headers=HEADERS)
@@ -184,6 +187,15 @@ class WorkerClient:
             ran = step()
             self.backoff = 1.0
             return ran
+        except ReplicaGone:
+            _wait_for_shutdown()
+        except WorkerUnknown:
+            # Surfra closed this worker and requeued what it held. Register again and keep going.
+            old = self.worker_id
+            self.register(copies)
+            if self.stream is not None and old:
+                self.stream.replace(old, self.worker_id or "")
+            return False
         except httpx.HTTPStatusError as exc:
             status, text = exc.response.status_code, exc.response.text
             if status == 401 and "unknown replica token" in text:
@@ -204,6 +216,9 @@ class WorkerClient:
         return False
 
     def next_stages(self, limit: int, *, wait: float = 0.0) -> list[dict[str, Any]]:
+        if self.stream is not None and self.stream.ready():
+            # Pushed by Surfra on the stream as soon as it is queued; no request per call.
+            return self.stream.take(self.worker_id or "", limit, wait)
         response = self._http.post(
             f"{self.master}/v1/workers/next",
             json={"replica_token": self.replica_token, "worker_id": self.worker_id, "limit": limit, "wait": wait},
@@ -219,6 +234,8 @@ class WorkerClient:
     def heartbeat(self, held: int) -> None:
         """Report in without taking work. Refreshes the leases on what this worker holds."""
 
+        if self.stream is not None and self.stream.ready():
+            return  # the stream's beat covers every worker and what each holds
         response = self._beat_http.post(
             f"{self.master}/v1/workers/next",
             json={
@@ -245,6 +262,8 @@ class WorkerClient:
         response.raise_for_status()
 
     def report_progress(self, stage_id: str, fraction: float) -> None:
+        if self.stream is not None and self.stream.progress(self.worker_id or "", stage_id, fraction):
+            return
         try:
             self._http.post(
                 f"{self.master}/v1/workers/progress",
@@ -269,6 +288,16 @@ class WorkerClient:
     def settle(self, stages: list[dict[str, Any]], *, outputs: list[Any] | None = None, error: str | None = None) -> None:
         """Report every stage of a batch. One stage Surfra already took back does not lose the rest."""
 
+        if self.stream is not None and self.stream.ready():
+            # The outbox sends these until Surfra takes them; the worker moves on now.
+            for index, stage in enumerate(stages):
+                if error is not None:
+                    self.stream.result(self.worker_id or "", stage["id"], error=error)
+                else:
+                    self.stream.result(self.worker_id or "", stage["id"], output=(outputs or [])[index])
+            return
+        if self.stream is not None:
+            self.stream.finished(self.worker_id or "", [stage["id"] for stage in stages])
         for index, stage in enumerate(stages):
             try:
                 if error is not None:
@@ -282,6 +311,26 @@ class WorkerClient:
                     logship.note(f"Surfra no longer holds request stage {stage['id']} for this worker ({status}); result discarded")
                     continue
                 raise
+
+    def began(self, stages: list[dict[str, Any]]) -> None:
+        """These calls run now. The stream lists them in its beats, however they were taken."""
+
+        if self.stream is not None:
+            self.stream.begin(self.worker_id or "", stages)
+
+    def send_kept(self, item: dict[str, Any]) -> None:
+        """A result the stream could not deliver, sent over HTTP. A refusal means Surfra moved on: drop it."""
+
+        self.worker_id = item["worker"]
+        try:
+            if item["type"] == "done":
+                self._until_taken(lambda: self.complete(item["stage"], item.get("output")))
+            else:
+                self._until_taken(lambda: self.fail(item["stage"], item.get("error") or "failed", counts=bool(item.get("counts", True))))
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code < 500 and exc.response.status_code != 429:
+                return
+            raise
 
     def _until_taken(self, send: Any) -> None:
         """Send a finished result until Surfra takes it. A 5xx, a 429 or no connection means it did not."""
@@ -331,6 +380,7 @@ class WorkerClient:
                 return False
             stages = stages[:count]
         self.waiting = False
+        self.began(stages)
         hook = bind_progress_hook(lambda fraction, _message="": [self.report_progress(stage["id"], fraction) for stage in stages])
         timeout = execution_timeout()
 
@@ -348,6 +398,8 @@ class WorkerClient:
             failure = str(exc)
         finally:
             unbind_progress_hook(hook)
+        if beat.lost and self.stream is not None:
+            self.stream.finished(self.worker_id or "", [stage["id"] for stage in stages])
         if beat.timed_out or beat.lost:
             return True
         if failure is not None:
@@ -450,6 +502,7 @@ def _serve_in_process(master: str, replica_token: str, app_path: str, *, once: b
     clients = [WorkerClient(master, replica_token) for _ in range(copies)]
     for client in clients:
         client.register(copies)
+    _start_stream(master, replica_token, clients)
     threads = [
         threading.Thread(target=_loop, args=(client,), kwargs={"once": once, "interval": interval, "copies": copies}, daemon=True)
         for client in clients
@@ -605,6 +658,7 @@ def _serve_supervised(master: str, replica_token: str, app_path: str, *, once: b
         clients = [WorkerClient(master, replica_token) for _ in range(copies)]
         for client in clients:
             client.register(copies)
+        _start_stream(master, replica_token, clients)
         pending: dict[str, dict[str, Any]] = {}
         answers: dict[str, dict[str, Any]] = {}
         lock = threading.Lock()
@@ -668,6 +722,7 @@ def _step_remote(
             return False
         stages = stages[:count]
     client.waiting = False
+    client.began(stages)
     job_id = f"{client.worker_id}-{time.monotonic_ns()}"
     event = threading.Event()
     with lock:
@@ -693,6 +748,8 @@ def _step_remote(
         message = answers.pop(job_id, None)
         pending.pop(job_id, None)
     if beat.lost:
+        if client.stream is not None:
+            client.stream.finished(client.worker_id or "", [stage["id"] for stage in stages])
         return True
     if reason is not None:
         client.settle(stages, error=reason)
@@ -721,6 +778,21 @@ def serve(master: str, replica_token: str, app_path: str, *, once: bool = False,
     except _StartFailed as exc:
         print(f"worker processes failed to start ({exc}); running in this process", flush=True)
         _serve_in_process(master, replica_token, app_path, once=once, interval=interval)
+
+
+def _start_stream(master: str, replica_token: str, clients: list[WorkerClient]) -> ReplicaStream | None:
+    """One stream for every worker in this container. SURFRA_STREAM=0 keeps them on HTTP polls."""
+
+    if os.environ.get("SURFRA_STREAM", "").strip().lower() in {"0", "false", "no", "off"}:
+        return None
+    sender = WorkerClient(master, replica_token)
+    stream = ReplicaStream(master, replica_token, send_http=sender.send_kept)
+    if stream.url is None:
+        return None
+    for client in clients:
+        stream.attach(client.worker_id or "")
+        client.stream = stream
+    return stream.start()
 
 
 def _wait_for_shutdown() -> None:

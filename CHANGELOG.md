@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.0] - 2026-10-30
+
+### Added
+- The replica stream: one WebSocket (`wss://`) per replica carries every worker's calls, results and heartbeats.
+  - **Calls are pushed.** A free worker grants credit, and Surfra sends the next call as soon as one is queued. Polling costs a request to ask and one to report per call.
+  - **Results don't block.** A result goes into an outbox, and the worker moves on. Each result stays there until Surfra acknowledges it, and is sent again on the next connection if the stream drops. After 15 s without a connection, it goes over HTTPS instead.
+  - **One heartbeat covers the replica.** Every 10 s it lists what each worker holds. Surfra keeps those leases and requeues anything it sent that never arrived.
+  - **It reconnects on its own:** at once when Surfra restarts, with backoff after network errors. A closed worker registers again and rejoins.
+  - **Fallback:** a control plane without the stream, or a stream that keeps failing, puts workers back on HTTPS polling. The stream is tried again later.
+  - `SURFRA_STREAM=0` keeps workers on polling.
+- Dependency: `websockets>=15`.
+
 ## [0.5.2] - 2026-10-30
 
 ### Changed
