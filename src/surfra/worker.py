@@ -35,6 +35,9 @@ HEARTBEAT_SECONDS = 15.0
 DEFAULT_EXECUTION_TIMEOUT = 1200.0
 # How long a replacement worker process may take to load the app before the container restarts.
 RESTART_READY_SECONDS = 900.0
+# A finished result Surfra could not take (busy, restarting, in maintenance) is sent again, waits doubling to
+# 30 s, for this long before it is given up. Surfra hands a result it never got to another worker.
+RESULT_RETRY_SECONDS = 600.0
 
 
 def execution_timeout() -> float:
@@ -269,9 +272,9 @@ class WorkerClient:
         for index, stage in enumerate(stages):
             try:
                 if error is not None:
-                    self.fail(stage["id"], error)
+                    self._until_taken(lambda: self.fail(stage["id"], error))
                 else:
-                    self.complete(stage["id"], (outputs or [])[index])
+                    self._until_taken(lambda: self.complete(stage["id"], (outputs or [])[index]))
             except httpx.HTTPStatusError as exc:
                 status, text = exc.response.status_code, exc.response.text
                 if status == 409 or (status == 401 and "worker is not registered" in text):
@@ -279,6 +282,28 @@ class WorkerClient:
                     logship.note(f"Surfra no longer holds request stage {stage['id']} for this worker ({status}); result discarded")
                     continue
                 raise
+
+    def _until_taken(self, send: Any) -> None:
+        """Send a finished result until Surfra takes it. A 5xx, a 429 or no connection means it did not."""
+
+        give_up = time.monotonic() + RESULT_RETRY_SECONDS
+        wait = 1.0
+        while True:
+            try:
+                send()
+                return
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if (status < 500 and status != 429) or time.monotonic() >= give_up:
+                    raise
+                reason = f"{status} {exc.response.reason_phrase}"
+            except httpx.TransportError as exc:
+                if time.monotonic() >= give_up:
+                    raise
+                reason = type(exc).__name__
+            logship.note(f"Surfra did not take a finished result ({reason}); sending it again in {wait:.0f}s")
+            time.sleep(wait * random.uniform(0.75, 1.25))
+            wait = min(wait * 2, 30.0)
 
     def step(self) -> bool:
         """Pull a batch, or one request, and run the handler."""

@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.1] - 2026-10-30
+
+### Changed
+- A worker keeps a finished result Surfra could not take (a 5xx, a 429, or no connection: busy, restarting, in maintenance) and sends it again, waits doubling to 30 s, for up to 10 minutes. It used to drop the result, and Surfra ran the request again once its lease ran out. A 409 (Surfra gave the request to another worker) is still dropped at once.
+
 ## [0.5.0] - 2026-10-29
 
 ### Added

@@ -56,3 +56,38 @@ def test_a_stopped_replica_waits_for_shutdown(client, monkeypatch):
 def test_a_bad_request_still_raises(client):
     with pytest.raises(httpx.HTTPStatusError):
         client.guard(_raise(_status(400, "bad")), 1)
+
+
+def test_a_finished_result_is_sent_again_until_surfra_takes_it(client, monkeypatch):
+    answers = [_status(503, '{"error":{"type":"SERVER_BUSY"}}'), httpx.ConnectError("down"), None]
+    sent = []
+
+    def complete(stage_id, output):
+        sent.append(stage_id)
+        answer = answers.pop(0)
+        if answer is not None:
+            raise answer
+
+    monkeypatch.setattr(client, "complete", complete)
+    client.settle([{"id": "stg_1"}], outputs=[{"ok": True}])
+    assert sent == ["stg_1", "stg_1", "stg_1"]
+
+
+def test_a_result_surfra_no_longer_holds_is_dropped_not_retried(client, monkeypatch):
+    sent = []
+
+    def complete(stage_id, output):
+        sent.append(stage_id)
+        raise _status(409, '{"detail":"lease fence rejected the completion"}')
+
+    monkeypatch.setattr(client, "complete", complete)
+    client.settle([{"id": "stg_1"}, {"id": "stg_2"}], outputs=[1, 2])
+    assert sent == ["stg_1", "stg_2"]
+
+
+def test_a_result_is_given_up_after_the_retry_window(client, monkeypatch):
+    clock = iter(range(0, 10_000, 120))
+    monkeypatch.setattr(worker.time, "monotonic", lambda: float(next(clock)))
+    monkeypatch.setattr(client, "fail", lambda stage_id, error: (_ for _ in ()).throw(_status(503)))
+    with pytest.raises(httpx.HTTPStatusError):
+        client.settle([{"id": "stg_1"}], error="boom")
