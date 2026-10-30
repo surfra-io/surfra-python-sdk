@@ -209,3 +209,16 @@ def test_sync_calls_work_from_threads_and_inside_a_running_loop(sx):
         return client.transaction("tx_1")  # no await: today's sync behavior
 
     assert asyncio.run(inside_async_def())["id"] == "tx_1"
+
+
+def test_the_deploy_setting_wins_over_the_handler(monkeypatch):
+    from surfra.worker import worker_count
+
+    monkeypatch.setenv("SURFRA_MAX_ONGOING", "8")
+    assert worker_count({"concurrent_workers": 1}) == 8
+    monkeypatch.setenv("SURFRA_MAX_ONGOING", "500")
+    assert worker_count({"concurrent_workers": 1}) == 64
+    monkeypatch.delenv("SURFRA_MAX_ONGOING")
+    assert worker_count({"concurrent_workers": 3}) == 3  # a local run, or nothing set at deploy
+    monkeypatch.setenv("SURFRA_MAX_ONGOING", "nope")
+    assert worker_count({}) == 1

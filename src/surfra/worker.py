@@ -383,6 +383,21 @@ def _signal_ready(results: Any) -> None:
     results.put({"kind": "ready"})
 
 
+def worker_count(spec: dict[str, Any]) -> int:
+    """Workers per replica. Surfra's deploy setting wins (the machine row's num_workers, sent as
+    SURFRA_MAX_ONGOING), because the right number depends on the machine; the handler's concurrent_workers
+    is the default when nothing is set, as in a local run."""
+
+    raw = os.environ.get("SURFRA_MAX_ONGOING", "").strip()
+    try:
+        deployed = int(raw) if raw else 0
+    except ValueError:
+        deployed = 0
+    if deployed >= 1:
+        return min(deployed, 64)
+    return max(1, int(spec.get("concurrent_workers") or 1))
+
+
 def deployment_mode() -> str:
     """Isolated or joint. The autoscaler copies this from the app deployment."""
 
@@ -397,7 +412,7 @@ def _child_entry(app_path: str, jobs: Any, results: Any, mode: str) -> None:
     load_app(app_path)
     run_warmup()
     spec = registered_handler_spec() or {}
-    copies = 1 if mode == "isolated" else max(1, int(spec.get("concurrent_workers") or 1))
+    copies = 1 if mode == "isolated" else worker_count(spec)
     results.put({"kind": "ready", "spec": spec})
 
     def run_one() -> None:
@@ -431,7 +446,7 @@ def _serve_in_process(master: str, replica_token: str, app_path: str, *, once: b
     run_warmup()
     logship.note(f"{app_path} loaded and warmed up in {time.monotonic() - began:.1f}s")
     spec = registered_handler_spec() or {}
-    copies = max(1, int(spec.get("concurrent_workers") or 1))
+    copies = worker_count(spec)
     clients = [WorkerClient(master, replica_token) for _ in range(copies)]
     for client in clients:
         client.register(copies)
@@ -575,7 +590,7 @@ def _serve_supervised(master: str, replica_token: str, app_path: str, *, once: b
         logship.note(f"{app_path} loaded and warmed up in {time.monotonic() - began:.1f}s")
         adopt_handler_spec(first["spec"])
         spec = registered_handler_spec() or {}
-        copies = max(1, int(spec.get("concurrent_workers") or 1))
+        copies = worker_count(spec)
         if mode == "isolated" and copies > 1:
             for _ in range(copies - 1):
                 slots.append(_Slot(ctx, app_path, mode, replica_token, results, ready))

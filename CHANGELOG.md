@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.2] - 2026-10-30
+
+### Changed
+- Workers per replica come from the deploy: the machine row's `num_workers`, which Surfra sends as `SURFRA_MAX_ONGOING`. The handler's `concurrent_workers` is the default when nothing is set, and in local runs. Before, a row of 8 with a handler of 1 ran 1 worker while Surfra planned for 8.
+
 ## [0.5.1] - 2026-10-30
 
 ### Changed
