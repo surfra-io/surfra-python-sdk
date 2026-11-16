@@ -26,6 +26,8 @@ HOME = Path.home() / ".surfra"
 CONFIG = HOME / "config.json"
 RUNNER = HOME / "runner.json"
 PID = HOME / "runner.pid"
+LOCK = HOME / "runner.lock"
+_LOCK_HANDLE = None  # the open lock file; the lock lasts as long as this process
 
 
 def _master() -> str:
@@ -266,6 +268,11 @@ def start() -> int:
     if problem:
         print(problem, file=sys.stderr)
         return 1
+    if not _hold_lock():
+        other = PID.read_text().strip() if PID.exists() else "unknown"
+        print(f"a runner is already running on this machine (pid {other}). Two runners on one registration stop each other's apps.", file=sys.stderr)
+        print("See it with: systemctl --user status surfra-runner" if UNIT.exists() else "Stop it with: surfra runner stop", file=sys.stderr)
+        return 1
     master = (saved.get("master") or _master()).rstrip("/")
     headers = {"Authorization": f"Bearer {token}", **HEADERS}
     PID.write_text(str(os.getpid()))
@@ -296,6 +303,30 @@ def start() -> int:
                 time.sleep(5)
                 continue
             _run_assignment(http, master, saved, assignment)
+
+
+def _hold_lock() -> bool:
+    """One runner per registration. Two copies on one token each ran every assignment, removed each other's
+    containers, and a late release from one stopped the other's next replica (laptop-3080, 2026-11-15).
+
+    The OS drops the lock when the process ends, so a crash or reboot never leaves it stale. An update restart
+    (os.execv) closes the file and the new process takes the lock again.
+    """
+
+    global _LOCK_HANDLE
+    try:
+        import fcntl
+    except ImportError:  # no flock on Windows, where the runner does not run
+        return True
+    HOME.mkdir(parents=True, exist_ok=True)
+    handle = open(LOCK, "a")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return False
+    _LOCK_HANDLE = handle
+    return True
 
 
 def _pick_up_update(told: str) -> str:

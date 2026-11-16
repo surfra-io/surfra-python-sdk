@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.1] - 2026-11-16
+
+### Fixed
+- `surfra runner start` refuses to start a second runner on the same registration. Two copies (for example the systemd service and one started in a terminal) both ran every assignment, removed each other's containers, and stopped each other's replicas mid-call. The second copy now exits with the first one's pid and how to stop it. The lock is released when the runner exits, crashes or the machine restarts.
+
 ## [0.6.0] - 2026-10-30
 
 ### Added
